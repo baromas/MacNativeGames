@@ -247,6 +247,59 @@ static void patch_bench_cam(Module *m){
 #endif
 }
 #if !TARGET_OS_IPHONE
+/* Static placement and shared-record fades use alpha=counter/20 and advance by
+ * trunc(2.1*ratio30). At small positive frame steps the conversion is zero,
+ * leaving the mesh invisible or translucent. Retain a minimum increment of
+ * one only for finite positive input; zero/negative/NaN retain the original
+ * conversion, including pauses. At 30/60 real FPS the conversion is unchanged.
+ * This is a minimum-step workaround: high-FPS fades complete faster than at
+ * the shipping 30 Hz rate. It does not alter FrameRateMgr or global game time.
+ *
+ * Placement sites expect w8; shared-record sites expect w10. Both veneers use
+ * dead w11/w12, preserve
+ * s0/NZCV, and return through the BL link. These enclosing routines restore
+ * their caller's LR from the stack. No state, callbacks, counters or timers.
+ * The w8 stub follows the bounce veneer (+256..276), before Vert+ (+320..928).
+ * The w10 stub follows Vert+, ending before rewritten code at +1024.
+ * TOTK_PREACTOR_FADE_FIX=0 retains original behavior at every site;
+ * TOTK_SHARED_FADE_FIX=0 retains only the validated placement correction.
+ */
+static void patch_preactor_fade(Module *m){
+    if(getenv("TOTK_EXPORT_IOS"))return; /* The Mac host also prepares device code. */
+    const char *enabled=getenv("TOTK_PREACTOR_FADE_FIX");
+    if(enabled&&!strcmp(enabled,"0"))return;
+    const char *shared=getenv("TOTK_SHARED_FADE_FIX");
+    unsigned count=shared&&!strcmp(shared,"0")?2:4;
+    uint64_t padding=(m->text_end+15)&~15ULL,stubs[]={padding+276,padding+928};
+    const Patch guards[]={
+        {0xa7ac4,0x1e380008,0},{0xa7ac8,0x3942792a,0},
+        {0x95dd24,0x1e380008,0},{0x95dd28,0x0b080128,0},
+        {0x6155e4,0x1e38000a,0},{0x6155e8,0x0b0a012b,0},
+        {0x615660,0x1e38000a,0},{0x615664,0x0b0a012b,0},
+    };
+    const uint32_t code[][10]={
+        {0x1e380008,0x35000108,0x1e26000b,0x340000cb,0x37f800ab,0x5317796c,0x1100058c,0x3740004c,0x52800028,0xd65f03c0},
+        {0x1e38000a,0x3500010a,0x1e26000b,0x340000cb,0x37f800ab,0x5317796c,0x1100058c,0x3740004c,0x5280002a,0xd65f03c0},
+    };
+    uint32_t jumps[4];
+    if(stubs[0]+sizeof code[0]>padding+320||stubs[1]+sizeof code[1]>padding+1024||
+       stubs[1]+sizeof code[1]>((m->text_end+0xfff)&~0xfffULL))
+        runtime_fail("1.4.3 static fade veneer layout");
+    for(unsigned i=0;i<count*2;i++){
+        uint32_t word;
+        if(guards[i].off+4>m->text_end)runtime_fail("1.4.3 static fade site outside text");
+        memcpy(&word,m->base+guards[i].off,4);
+        if(word!=guards[i].original)runtime_fail("1.4.3 static fade original instruction mismatch");
+    }
+    for(unsigned s=0;s<count/2;s++)for(unsigned i=0;i<sizeof code[s];i++)
+        if(m->base[stubs[s]+i])runtime_fail("1.4.3 static fade veneer padding in use");
+    for(unsigned i=0;i<count;i++)jumps[i]=branch(guards[i*2].off,stubs[i/2])|0x80000000u;
+    for(unsigned s=0;s<count/2;s++)memcpy(m->base+stubs[s],code[s],sizeof code[s]);
+    for(unsigned i=0;i<count;i++){
+        memcpy(m->base+guards[i*2].off,jumps+i,4);
+    }
+    fprintf(stderr,"[totk] 1.4.3 static fade: minimum finite positive increment at %u guarded sites (%s); zero time and original counter arithmetic retained\n",count,count==4?"placement and shared":"placement only");
+}
 /* High-frame-rate diagnostics (Mac, TOTK_INPUT_FILE commands). Such bugs sit in game code that compares the game's time
    values with constants tuned for 30 Hz (#61: X+0x28 > 100 above). The time values: the FrameRateMgr singleton
    (main+0x3ada848; +0x10 30 Hz ratio, +0x18 seconds, +0x1c integer FPS) and the time object X = [[main+0x3ad27c8]+0xc8]
@@ -319,6 +372,7 @@ void runtime_game_patches(Module *m) {
     patch_fixed_res(m);
     patch_slowmo_bounce(m);
 #if !TARGET_OS_IPHONE
+    patch_preactor_fade(m);
     diag_main=m;   /* frmwatch / xpoke */
 #endif
     { static const uint64_t sites[] = {0x628c74, 0xb43460, 0x1ff04f4, 0x253fbb0};   /* camera update and setup, viewport x2 */
