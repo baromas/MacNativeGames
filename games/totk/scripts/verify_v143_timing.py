@@ -20,7 +20,7 @@ def main():
  target=out/'main-timing-fixture.bin'
  # The render-resolution patch is on by default on the Mac (e8edbcd: the scene at the canvas size); the fixture runs it as
  # shipped, so a TOTK_RENDER_RES left in the caller's environment is dropped.
- fixture_env={k:v for k,v in os.environ.items() if k!='TOTK_RENDER_RES'}|{'TOTK_REALTIME':'1','TOTK_FPS60':'1','TOTK_OUTPUT_RES':'0','TOTK_ASPECT':'0','TOTK_CLOTH_REALTIME':'1','TOTK_HIGHFPS_FIX':'1','TOTK_PREACTOR_FADE_FIX':'1','TOTK_SHARED_FADE_FIX':'1'}
+ fixture_env={k:v for k,v in os.environ.items() if k!='TOTK_RENDER_RES'}|{'TOTK_REALTIME':'1','TOTK_FPS60':'1','TOTK_OUTPUT_RES':'0','TOTK_ASPECT':'0','TOTK_CLOTH_REALTIME':'1','TOTK_HIGHFPS_FIX':'1','TOTK_PREACTOR_FADE_FIX':'1'}
  # Real-time frame step (runtime_frame_step_update): steady 120, 144, 160 and 240 fps, and short and long presents
  # alternating (around the 120 cap, and above it), must give game time = real time. A 1/120 s floor per interval made
  # 144 fps run 1.2x and 240 fps 2x fast, and alternating 1/240 + 1/80 s 1.33x fast. A hitch is cut at 1/15 s per

@@ -261,15 +261,12 @@ static void patch_bench_cam(Module *m){
  * their caller's LR from the stack. No state, callbacks, counters or timers.
  * The w8 stub follows the bounce veneer (+256..276), before Vert+ (+320..928).
  * The w10 stub follows Vert+, ending before rewritten code at +1024.
- * TOTK_PREACTOR_FADE_FIX=0 retains original behavior at every site;
- * TOTK_SHARED_FADE_FIX=0 retains only the validated placement correction.
+ * TOTK_PREACTOR_FADE_FIX=0 retains original behavior at all four sites.
  */
 static void patch_preactor_fade(Module *m){
     if(getenv("TOTK_EXPORT_IOS"))return; /* The Mac host also prepares device code. */
     const char *enabled=getenv("TOTK_PREACTOR_FADE_FIX");
     if(enabled&&!strcmp(enabled,"0"))return;
-    const char *shared=getenv("TOTK_SHARED_FADE_FIX");
-    unsigned count=shared&&!strcmp(shared,"0")?2:4;
     uint64_t padding=(m->text_end+15)&~15ULL,stubs[]={padding+276,padding+928};
     const Patch guards[]={
         {0xa7ac4,0x1e380008,0},{0xa7ac8,0x3942792a,0},
@@ -281,24 +278,25 @@ static void patch_preactor_fade(Module *m){
         {0x1e380008,0x35000108,0x1e26000b,0x340000cb,0x37f800ab,0x5317796c,0x1100058c,0x3740004c,0x52800028,0xd65f03c0},
         {0x1e38000a,0x3500010a,0x1e26000b,0x340000cb,0x37f800ab,0x5317796c,0x1100058c,0x3740004c,0x5280002a,0xd65f03c0},
     };
-    uint32_t jumps[4];
+    enum { COUNT=4 };
+    uint32_t jumps[COUNT];
     if(stubs[0]+sizeof code[0]>padding+320||stubs[1]+sizeof code[1]>padding+1024||
        stubs[1]+sizeof code[1]>((m->text_end+0xfff)&~0xfffULL))
         runtime_fail("1.4.3 static fade veneer layout");
-    for(unsigned i=0;i<count*2;i++){
+    for(unsigned i=0;i<COUNT*2;i++){
         uint32_t word;
         if(guards[i].off+4>m->text_end)runtime_fail("1.4.3 static fade site outside text");
         memcpy(&word,m->base+guards[i].off,4);
         if(word!=guards[i].original)runtime_fail("1.4.3 static fade original instruction mismatch");
     }
-    for(unsigned s=0;s<count/2;s++)for(unsigned i=0;i<sizeof code[s];i++)
+    for(unsigned s=0;s<COUNT/2;s++)for(unsigned i=0;i<sizeof code[s];i++)
         if(m->base[stubs[s]+i])runtime_fail("1.4.3 static fade veneer padding in use");
-    for(unsigned i=0;i<count;i++)jumps[i]=branch(guards[i*2].off,stubs[i/2])|0x80000000u;
-    for(unsigned s=0;s<count/2;s++)memcpy(m->base+stubs[s],code[s],sizeof code[s]);
-    for(unsigned i=0;i<count;i++){
+    for(unsigned i=0;i<COUNT;i++)jumps[i]=branch(guards[i*2].off,stubs[i/2])|0x80000000u;
+    for(unsigned s=0;s<COUNT/2;s++)memcpy(m->base+stubs[s],code[s],sizeof code[s]);
+    for(unsigned i=0;i<COUNT;i++){
         memcpy(m->base+guards[i*2].off,jumps+i,4);
     }
-    fprintf(stderr,"[totk] 1.4.3 static fade: minimum finite positive increment at %u guarded sites (%s); zero time and original counter arithmetic retained\n",count,count==4?"placement and shared":"placement only");
+    fprintf(stderr,"[totk] 1.4.3 static fade: minimum finite positive increment at four guarded placement and shared sites; zero time and original counter arithmetic retained\n");
 }
 /* High-frame-rate diagnostics (Mac, TOTK_INPUT_FILE commands). Such bugs sit in game code that compares the game's time
    values with constants tuned for 30 Hz (#61: X+0x28 > 100 above). The time values: the FrameRateMgr singleton
