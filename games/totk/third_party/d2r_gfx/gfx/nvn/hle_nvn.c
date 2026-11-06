@@ -199,13 +199,21 @@ static const int g_devinfo[] = {
     [0x4E] = 1024, [0x4F] = 32, [0x50] = 4096, [0x51] = 65536, [0x52] = 65536, [0x53] = 256, [0x54] = 16384,
     [0x55] = 262144, [0x56] = 4096, [0x57] = 1, [0x58] = 4, [0x59] = 2, [0x5A] = 0, [0x5B] = 4096, [0x5C] = 16384,
     [0x5D] = 4096, [0x5E] = 128, [0x5F] = 4096,
+#ifdef GAME_NS2
+    /* NVN2 SDK constants, adapted from MD5Visual a57fb5c2 / nxnative (MIT). */
+    [0x60] = 65535, [0x61] = 1, [0x63] = 256, [0x64] = 16, [0x65] = 65535, [0x66] = 65535, [0x67] = 256,
+    [0x68] = 1, [0x69] = 16, [0x6A] = 16, [0x6B] = 16, [0x6C] = 1, [0x6D] = 1, [0x6E] = 1, [0x6F] = 256,
+    [0x70] = 0, [0x71] = 16, [0x72] = 8, [0x73] = 16, [0x74] = 32, [0x75] = 31, [0x76] = 536870912,
+    [0x77] = 16777216, [0x78] = 16777216, [0x79] = 1073741824, [0x7A] = 32, [0x7B] = 1, [0x7C] = 64,
+    [0x7E] = 1, [0x7F] = 2147483647, [0x80] = 32, [0x81] = 32, [0x82] = 4194303, [0x83] = 512, [0x84] = 256,
+    [0x85] = 32, [0x86] = 16383, [0x88] = 8, [0x89] = 0, [0x8A] = 0, [0x8B] = 4, [0x8C] = 256, [0x8D] = 16,
+    [0x8E] = 0, [0x8F] = 1, [0x90] = 31, [0x91] = 0, [0x92] = 64, [0x93] = 1, [0x94] = 58368, [0x95] = 24576,
+    [0x96] = 0, [0x97] = 256, [0x98] = 262144, [0x9B] = 0, [0x9C] = 201, [0x9D] = 14, [0x9E] = 201,
+    [0x9F] = 20, [0xA0] = 163840, [0xA1] = 8, [0xA2] = 4, [0xA3] = 256, [0xA4] = 256, [0xA5] = 4,
+    [0xA6] = 65536, [0xA7] = 201, [0xA8] = 5, [0xA9] = 1,
+#endif
 };
 NVN(nvnDeviceGetInteger, void, const NVNdevice *d, NVNdeviceInfo what, int *out) {
-#ifdef GAME_NS2
-    /* NVN2 shader control/code alignment, as served by nxnative 865cc35f (MIT). The movie library asks this before
-       loading NDVE programs. Our page-aligned shader storage satisfies the required 256-byte alignment. */
-    if ((unsigned)what == 0x67) { *out = 256; return; }
-#endif
     (void)d;
     unsigned w = (unsigned)what;
     // 0x5F 分离采样器绑定数、0x60/0x61 在 SMO 实测表里没有：0x5F 按采样器池上限给 4096 未核，0x60/0x61 报红给 0

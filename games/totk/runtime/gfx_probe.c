@@ -89,7 +89,7 @@ static void probe_minimal_layout(void) {
 void runtime_gfx_probe(int negative){
  probe_texture_plan();
  lookup=runtime_gfx_override("nvnBootstrapLoader");if(!lookup)runtime_fail("bootstrap override");
- if(negative){((uint64_t(*)(const void *))fn("nvnCommandBufferDrawTexture"))(NULL);runtime_fail("unimplemented NVN returned");}
+ if(negative==1){((uint64_t(*)(const void *))fn("nvnCommandBufferDrawTexture"))(NULL);runtime_fail("unimplemented NVN returned");}
  struct{alignas(16) NVNtexture value;unsigned char guard[64];} texture;
  NVNtextureBuilder builder;memset(&builder,0,sizeof(builder));memset(&texture,0xa5,sizeof(texture));
  CALL(nvnTextureBuilderSetDefaults,&builder);CALL(nvnTextureBuilderSetSize2D,&builder,1920,1080);CALL(nvnTextureBuilderSetFormat,&builder,NVN_FORMAT_RGBA8);
@@ -100,7 +100,16 @@ void runtime_gfx_probe(int negative){
  if(CALL(nvnTextureGetStorageClass,&texture.value)!=CALL(nvnTextureBuilderGetStorageClass,&builder))runtime_fail("texture storage class identity");
  CALL(nvnTextureFinalize,&texture.value);
  for(unsigned i=0;i<64;i++)if(texture.guard[i]!=0xa5)runtime_fail("NVN texture finalize overflow");
- int major=0,minor=0;CALL(nvnDeviceGetInteger,NULL,0,&major);CALL(nvnDeviceGetInteger,NULL,1,&minor);if(major!=55||minor<15)runtime_fail("TOTK NVN ABI target");
+ int major=0,minor=0;CALL(nvnDeviceGetInteger,NULL,0,&major);CALL(nvnDeviceGetInteger,NULL,1,&minor);
+#ifdef GAME_NS2
+ if(major!=231||minor<40)runtime_fail("NS2 NVN ABI target");
+ const int properties[][2]={{0x60,65535},{0x63,256},{0x67,256},{0x78,16777216},{0x8c,256},{0xa9,1}};
+ for(unsigned i=0;i<sizeof properties/sizeof properties[0];i++){int got=-1;CALL(nvnDeviceGetInteger,NULL,properties[i][0],&got);if(got!=properties[i][1])runtime_fail("NS2 NVN device constant");}
+#else
+ if(major!=55||minor<15)runtime_fail("TOTK NVN ABI target");
+#endif
+
+ if(negative==2){printf("{\"status\":\"pass\",\"probe\":\"nvn-device-properties\",\"major\":%d,\"minor\":%d}\n",major,minor);exit(0);}
  if(lookup("TOTK_not_an_nvn_entry"))runtime_fail("unknown NVN lookup should be null");
  probe_linear_layout();
  probe_minimal_layout();

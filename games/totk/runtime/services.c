@@ -389,12 +389,12 @@ static void observed_abort(uint64_t a0,uint64_t a1,uint64_t a2,uint64_t a3,uint6
 }
 static void *observed_std_alloc(void *self,uint64_t size,uint64_t align){static unsigned n;if(n<5){n++;fprintf(stderr,"[totk-probe] StandardAllocator::Allocate self=%llx size=%llx align=%llx\n",(unsigned long long)(uintptr_t)self,(unsigned long long)size,(unsigned long long)align);}void *r=((void*(*)(void*,uint64_t,uint64_t))runtime_symbol("_ZN2nn3mem17StandardAllocator8AllocateEmm"))(self,size,align);if(!r)fprintf(stderr,"[totk-probe]   -> null\n");return r;}
 /* TEMP probe (OoT boot): the game's job system deadlocks on a LightEvent — trace the pair. */
-static void lv_log(const char *tag, void *ev){unsigned char*p=ev;uint64_t tid;pthread_threadid_np(NULL,&tid);
+static void lv_log(const char *tag, void *ev){if(!getenv("TOTK_WAIT_LOG"))return;unsigned char*p=ev;uint64_t tid;pthread_threadid_np(NULL,&tid);
  fprintf(stderr,"[lv-probe] %s th=%llx ev=%llx [%02x %02x %02x %02x %02x %02x %02x %02x]\n",tag,(unsigned long long)tid,(unsigned long long)(uintptr_t)ev,p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7]);fflush(stderr);}
 static void observed_light_wait(void *ev){lv_log("W ",ev);
- ((void(*)(void*))runtime_symbol("_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE"))(ev);fprintf(stderr,"[lv-probe] W  -> done\n");fflush(stderr);}
+ ((void(*)(void*))runtime_symbol("_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE"))(ev);if(getenv("TOTK_WAIT_LOG")){fprintf(stderr,"[lv-probe] W  -> done\n");fflush(stderr);}}
 static uint32_t observed_light_timedwait(void *ev,uint64_t ts){lv_log("TW",ev);
- uint32_t r=((uint32_t(*)(void*,uint64_t))runtime_symbol("_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE"))(ev,ts);fprintf(stderr,"[lv-probe] TW -> %x\n",r);fflush(stderr);return r;}
+ uint32_t r=((uint32_t(*)(void*,uint64_t))runtime_symbol("_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE"))(ev,ts);if(getenv("TOTK_WAIT_LOG")){fprintf(stderr,"[lv-probe] TW -> %x\n",r);fflush(stderr);}return r;}
 static void observed_light_signal(void *ev){lv_log("S ",ev);
  ((void(*)(void*))runtime_symbol("_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE"))(ev);}
 static void observed_light_clear(void *ev){lv_log("C ",ev);
