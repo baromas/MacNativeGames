@@ -547,6 +547,7 @@ static partial class ShaderService
     // the MSL steps after SPIRV-Cross that every stage takes
     static string PostProcess(string src, HashSet<long> depthSlots)
     {
+        src = Hmma.Rewrite(src);
         if (depthSlots.Count > 0)
             src = RewriteDepthTextures(src, depthSlots);
         src = MatchSwitchDepthSampling(src);

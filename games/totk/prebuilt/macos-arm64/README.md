@@ -42,3 +42,5 @@ so no process is started per shader (`TOTK_XLATE_SPIRV_CROSS=process` still runs
 by preparing the whole 1.4.3 seed with both builds from the same inputs: all 95,227 files (MSL, reflection, variant
 indexes) byte-identical; the translation took as long (268 s / 270 s: the preparing script's 8 workers wait on each
 reply) for about half the CPU (508 s instead of 961 s, system time 90 s instead of 294 s).
+
+The current chain `totk-native-v11-native-hmma` adds the native HMMA postprocessing described in `docs/oot-native-hmma.md`; matching Mac and iOS translator outputs are rebuilt together.
