@@ -1,5 +1,8 @@
 # OoT AV1 integration groundwork
 
+Historical preparation note. The subsequent implementation and current limitations are in
+[OoT SDK 22 AV1 integration](oot-sdk22-av1.md).
+
 This is preparation for an SDK adapter, not a working OoT movie implementation. No game bytes or video are included.
 The local title is 0400486024DEC000, standalone update v131072. MD5Visual's bring-up base is `2e7e6036`.
 
