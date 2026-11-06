@@ -158,7 +158,7 @@ verify-boot: runtime
 
 
 
-GFX_HEADERS := $(wildcard third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h zeldaVR/gfx/*.h zeldaVR/runtime/*.h)
+GFX_HEADERS := third_party/d2r_gfx/gfx/nvn/oot_movie_direct.inc third_party/d2r_gfx/gfx/nvn/oot_movie_probe.inc $(wildcard third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h zeldaVR/gfx/*.h zeldaVR/runtime/*.h)
 
 build/gfx/%.o: % $(GFX_HEADERS) Makefile
 	@mkdir -p "$(dir $@)"
@@ -204,6 +204,10 @@ probe-gfx: runtime
 probe-gpu-pool-retire probe-gpu-tex-slots probe-gpu-arg-epoch probe-gpu-vertex-streams probe-gpu-vin probe-gpu-fout probe-gpu-pipeline-archive probe-gpu-widen probe-gpu-blockrt probe-gpu-midclear probe-gpu-winding probe-gpu-tile probe-gpu-depth-output probe-gpu-srgb-view probe-gpu-ds-clear probe-gpu-ub-rename probe-gpu-ubo-snapshot probe-gpu-upload-batch probe-gpu-storage-view probe-gpu-linear-rt probe-gpu-image-usage probe-gpu-texture-retire probe-gpu-texels-region probe-gpu-layer-merge probe-gpu-cube-merge probe-gpu-compressed-alias probe-gpu-drv-c0 probe-gpu-dispatch-chain probe-gpu-copy-alias: runtime
 	MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=assert TOTK_HEADLESS=1 build/totk-native rewritten/v0 $@ > analysis/native-$@.json
 	cat analysis/native-$@.json
+.PHONY: probe-gpu-oot-movie
+probe-gpu-oot-movie: binary-oot
+	MTL_DEBUG_LAYER=1 MTL_DEBUG_LAYER_ERROR_MODE=assert TOTK_HEADLESS=1 TOTK_OOT_MOVIE_DIRECT=1 build/totk-native-oot rewritten/oot $@
+
 .PHONY: probe-game-slot desktop-launcher
 # One game at a time: queue order, the user's game going first and stopping an agent's game, the slot passed down
 # by a wrapper, refusals of a wrong descriptor, games outside the slot, wait limit; dry runs only (no game boots).

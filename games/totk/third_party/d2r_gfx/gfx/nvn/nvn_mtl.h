@@ -57,6 +57,7 @@ int mtl_probe_storage_view(void);
 int mtl_probe_compressed_alias(void);
 int mtl_probe_linear_rt_upload(void);
 int mtl_probe_image_usage(void);
+int mtl_probe_oot_movie(void);
 int mtl_probe_texels_region(void);
 int mtl_probe_texture_retire(void);
 int mtl_probe_ds_clear(void);
