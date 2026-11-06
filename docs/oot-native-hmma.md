@@ -15,3 +15,13 @@ The shader chain is now `totk-native-v11-native-hmma`. Mac and iOS native transl
 - Frequent LightEvent observer diagnostics are gated with TOTK_WAIT_LOG, preserving the original guest calls and return values.
 
 Installed TOTK remains untouched. Full-suite and OoT visual results are recorded as they finish. No game window or texture-pixel readback is performed.
+
+## Follow-up from nxnative
+
+The final chain is `totk-native-v12-guarded-hmma`, incorporating MIT nxnative 9507c221's guarded deferred-write correction via Kolkka's patch 0009 (PR1836 revision f70b81ba). A deferred register write records the predicate at issue and only commits if it held; a final predicated instruction must not jump past pending commits. The focused constructed-instruction regression fails with the old translator and passes with the new one. This is the fix the upstream OoT work associates with lost glyph-quad coordinates.
+
+The LightEvent-wrapper test verifies all original calls, the full 64-bit timeout and 32-bit return value with logging off and on. The full generic graphics probe separately exposed an existing NS2 minimal-layout/oracle mismatch; the new `probe-nvn-properties` checks the production device thunks independently of that unrelated layout case.
+
+The first combined unit run had a timeout-fixture error (its fake tar never wrote its PID under concurrent build load). The final suite is run again after builds complete; no change to the archive tests is made.
+
+Final combined validation: 1482 tests, 165 skipped, no failures/errors (238.442 s), with heavy builds complete before the suite. All eight Mac runtime targets build, and base/NS2 host syntax checks pass for iOS. The independent device-property probe is recorded below after its run. Whole-game visual output remains to be confirmed in one new launch.

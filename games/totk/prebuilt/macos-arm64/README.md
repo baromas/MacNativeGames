@@ -6,7 +6,7 @@ SDK 10.0.401. A constructed program in both matrix layouts fails against the pre
 and passes against the rebuilt one (two barriers, correct scopes/semantics around the shared loads). SPIRV-Cross
 emits the corresponding two Metal threadgroup-memory SIMD barriers, and the Metal compiler accepts both programs.
 Four non-LDSM synthetic service requests (DebugMode on/off) retain byte-identical SPIR-V, MSL and reflection. This is
-not a whole-game shader regression or proof that OoT's pink movie output is fixed. The translation chain is now
+not a whole-game shader regression or proof that OoT's pink movie output is fixed. That change introduced
 `totk-native-v10-ldsm-order`, so stale generated shaders are not reused under the normal cache path.
 
 `totk_xlate` is the program the game starts to translate its shaders (`totk_xlate --service`): the Ryujinx shader
@@ -43,4 +43,4 @@ by preparing the whole 1.4.3 seed with both builds from the same inputs: all 95,
 indexes) byte-identical; the translation took as long (268 s / 270 s: the preparing script's 8 workers wait on each
 reply) for about half the CPU (508 s instead of 961 s, system time 90 s instead of 294 s).
 
-The current chain `totk-native-v11-native-hmma` adds the native HMMA postprocessing described in `docs/oot-native-hmma.md`; matching Mac and iOS translator outputs are rebuilt together.
+The current chain `totk-native-v12-guarded-hmma` adds native HMMA postprocessing and guarded deferred-write correctness, described in `docs/oot-native-hmma.md`. Matching Mac and iOS translator outputs are rebuilt together.
