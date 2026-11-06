@@ -10,7 +10,7 @@ A storage image binding establishes image use even without the optional NVN IMAG
 substituted its discard dummy when such a texture lacked Metal ShaderWrite usage. It also required ShaderWrite for
 read-only images, although existing reflection already distinguishes those access modes.
 
-- Prepare writable plain RGBA8 images before opening a compute encoder or drawing. Recreate storage with ShaderWrite
+- Prepare writable RGBA8 and RGBA8-sRGB images before opening a compute encoder or drawing. Recreate storage with ShaderWrite
   on the GPU timeline, copying all levels/slices through the existing usage-upgrade mechanism. Split an active render
   pass before recreation. Sampling aliases re-resolve after the storage generation changes.
 - Preserve the guest descriptor. Only the renderer's registered descriptor gains its discovered usage requirement.
@@ -22,7 +22,7 @@ read-only images, although existing reflection already distinguishes those acces
 ## Checks
 
 `probe-gpu-image-usage` uses generated 16x16 textures and two short test Metal kernels, through production resource
-preparation, compute dispatch and argument encoding. It checks 12,288 values: preserved source pixels, real compute
+preparation, compute dispatch and argument encoding. It checks 22,528 values: preserved source pixels, real compute
 writes, sampling aliases, retention of the old in-flight texture, render-pass splitting, no stale CPU restoration,
 and read-only image updates without GPU ownership. Metal API validation is enabled.
 
@@ -40,3 +40,19 @@ A text-only OoT movie trace reports the first conversion output as RGBA8 (`forma
 pool_flags=0x24), causing the old path to write a dummy. This fix addresses that concrete missing output operation.
 A subsequent game trial stalled before AV1 initialization, so it cannot establish whether the complete movie picture
 is correct. Black/pink video is not claimed fixed. Installed TOTK and its settings are untouched.
+
+## sRGB follow-up
+
+The next real movie trial reached AV1 and the first usage upgrade, but then reported a writable sRGB output
+(`format=0x38`) without ShaderWrite usage. The same preparation now covers RGBA8-sRGB on Apple GPUs. A 0.25/0.5/0.75
+linear compute write must produce about 137/188/225 in its raw sRGB bytes, while alpha stays linear. The extended
+probe checks both formats, with and without an active render pass, plus read-only CPU updates (22,528 values).
+Sampling aliases keep the original pixel format; this does not replace sRGB with linear UNORM or change gamma.
+
+The expanded probe also needed to retain its synthetic NvShader objects for its lifetime, matching production's
+permanent shader cache. Releasing a fixture while the compute-PSO pointer-key cache retained its pipeline allowed
+an allocator to reuse that identity for another fixture. No production cache policy is changed to mask that test bug.
+
+That game trial ended with a deliberate missing-driver-state abort on a vertex shader reading c0+0x640, not an OOM
+or GPU fault. A separate opt-in diagnostic, documented below, addresses investigation only; correct complete video
+and playability remain unverified.
