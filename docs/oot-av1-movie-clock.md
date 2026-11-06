@@ -17,3 +17,5 @@ The output at 20 renders/s is about 0.95 s of movie per elapsed second rather th
 Final builds, full-suite results and the warm-cache game trial are recorded as they complete. No iOS game run is claimed.
 
 Final validation: all eight shared Mac runtime targets built, with the three NS2 binaries rebuilt after the final codec edits; iOS codec/frontend syntax checks pass (no complete iOS app/device run). Full suite with the actual pinned dav1d prefix: 1482 tests, 164 skipped, no failures/errors, 278.620 seconds. Warm-cache in-game audiovisual confirmation is pending.
+
+The warm-cache v131072 text-only trial delivers movie_ms=39533.000 at clock_ms=39604.616, with adjacent samples tracking about 1x and 60-72 ms lag. This verifies timestamp progression in the real codec path; perceived audiovisual sync is pending user confirmation. The same run reaches unimplemented DrawMeshTasks calls, identifying the next 3D rendering dependency.
