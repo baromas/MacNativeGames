@@ -72,13 +72,16 @@ void runtime_warm_title(void){}   /* the start-up screen already goes with the f
 int dm_thermal_now(void){return (int)NSProcessInfo.processInfo.thermalState;}
 uint64_t front_game_res(int docked){(void)docked;return (720ULL<<32)|1280;}
 static _Atomic int appActive=1;
+static _Atomic uint64_t movieFocusEpoch;
 int runtime_front_focus(void){return atomic_load(&appActive);}
+int runtime_front_movie_focus(uint64_t *epoch){*epoch=atomic_load(&movieFocusEpoch);return atomic_load(&appActive);}
 void mtl_app_active(int active);
 void mtl_hud_safe_area(int w,int h,int side,int bottom);   /* gfx/nvn/nvn_mtl.m: the HUD boxes keep out of the safe area */
 void runtime_ios_sync_safe_area(UIView *host);
 /* Not active (background, Control Center, lock): stop GPU submission (iOS rejects background GPU work) and tell the game focus changed, like the Mac window. */
 static void app_active_changed(int active){
  if(atomic_exchange(&appActive,active)==active)return;
+ atomic_fetch_add(&movieFocusEpoch,1);
  if(!active)runtime_input_clear();
  mtl_app_active(active);runtime_oe_push_message(15);
  if(active)runtime_feedback_active();

@@ -5,6 +5,12 @@
 #include <sys/mman.h>
 
 typedef struct { uint32_t signalled, alive; } event;
+static double test_now;
+static uint64_t test_frames, test_focus_epoch;
+static int test_focused = 1;
+uint64_t dm_nvn_frame_count(void) { return test_frames; }
+int runtime_front_movie_focus(uint64_t *epoch) { *epoch=test_focus_epoch; return test_focused; }
+static double fake_clock(void) { return test_now; }
 static unsigned bound, destroyed, prepared;
 static void event_clear(void *p) { event *e=p;assert(e->alive==0x45564e54);e->signalled=0; }
 static void event_destroy(void *p) { event *e=p;assert(e->alive==0x45564e54);e->alive=0;destroyed++; }
@@ -91,7 +97,51 @@ static void run(unsigned w,unsigned h,const uint8_t *packet,size_t bytes,int for
     free(y);free(uv);free(rgba);assert(!munmap(memory,mapped));
 }
 
+static void clear_held(cv_dec *d) { while(d->nheld)vpx_img_free(d->held[--d->nheld]); }
+static void hold_at(cv_dec *d,int64_t ts,int eos) {
+    vpx_image_t *im=vpx_img_alloc(NULL,VPX_IMG_FMT_I420,4,4,1);assert(im&&cv_hold(d,im,ts));d->held_eos[d->nheld-1]=(uint8_t)eos;
+}
+static unsigned movie_clock_cases(void) {
+    double (*saved)(void)=cv_clock;cv_clock=fake_clock;unsigned checked=0;
+    cv_dec d={.magic=CV_MAGIC,.codec=CV_AV1};test_now=100;test_frames=0;test_focus_epoch=0;test_focused=1;
+    hold_at(&d,0,0);hold_at(&d,16666667,0);cv_skip_late(&d);assert(d.nheld==2&&d.clk_on&&d.clk_t0==100);checked++;
+    test_now=100.05;cv_skip_late(&d);assert(d.nheld==2);checked++; /* 50 ms slack: keep both */
+    test_now=100.1;cv_skip_late(&d);assert(d.nheld==1&&d.skipped==1&&d.held_ts[0]==16666667);checked++;
+    clear_held(&d);hold_at(&d,33333333,1);hold_at(&d,50000000,0);test_now=120;cv_skip_late(&d);assert(d.nheld==2&&d.held_eos[0]);checked++;clear_held(&d);
+    /* A host stall preserves the clock and catches up. A real pause resets it. */
+    d.clk_last=16666667;d.take_frame=test_frames;d.take_focus=test_focus_epoch;
+    hold_at(&d,66666667,0);hold_at(&d,83333333,0);cv_skip_late(&d);assert(d.nheld==1&&d.clk_t0==100&&d.catchups==1&&d.catching);checked++;clear_held(&d);
+    test_frames=6;hold_at(&d,100000000,0);cv_skip_late(&d);assert(d.clk_t0==120&&d.restarts==1&&!d.catching);checked++;clear_held(&d);
+    d.take_frame=test_frames;test_now=125;test_focus_epoch++;hold_at(&d,116666667,0);cv_skip_late(&d);assert(d.clk_t0==125&&d.restarts==2);checked++;clear_held(&d);
+    d.take_focus=test_focus_epoch;d.clk_last=500000000;hold_at(&d,0,0);cv_skip_late(&d);assert(d.clk_ts0==0&&d.restarts==3);checked++;clear_held(&d);
+    /* 60 Hz timestamps delivered by production drain at 20 renders/s. */
+    memset(&d,0,sizeof d);d.magic=CV_MAGIC;d.codec=CV_AV1;test_frames=0;test_now=200;
+    hold_at(&d,0,0);d.pcount=1;d.pend[0]=0;drain(&d);assert(d.buf[0].ts==0);checked++;
+    int64_t sequence=1;
+    for(unsigned frame=1;frame<=20;frame++) {
+        test_now=200+frame*.05;test_frames++;
+        while(d.nheld<CV_HOLD&&sequence<=frame*3)hold_at(&d,sequence++*1000000000LL/60,0);
+        d.phead=0;d.pcount=1;d.pend[0]=0;drain(&d);
+        checked++;
+    }
+    assert(d.buf[0].ts>=933333333&&d.buf[0].ts<=1000000000&&d.skipped>0);checked++;clear_held(&d);
+    memset(&d,0,sizeof d);d.magic=CV_MAGIC;d.codec=CV_AV1;test_frames=0;test_now=300;
+    for(int64_t frame=0;frame<=60;frame++) {
+        test_now=300+(double)frame/60;test_frames++;
+        if(!frame){hold_at(&d,0,0);hold_at(&d,16666667,0);hold_at(&d,33333333,0);}
+        else hold_at(&d,(frame+2)*1000000000LL/60,0);
+        d.phead=0;d.pcount=1;d.pend[0]=0;drain(&d);
+        assert(llabs(d.buf[0].ts-frame*1000000000LL/60)<=1);checked++;
+    }
+    assert(!d.skipped);checked++;clear_held(&d);
+    /* Reset must start the next stream afresh. */
+    pthread_mutex_init(&d.mu,NULL);void *type=&d;d.event=NULL;d.vpx_ok=0;d.codec=CV_VP9;
+    assert(!cv_dec_reset(&type)&&!d.clk_on&&!d.catching);if(d.vpx_ok)vpx_codec_destroy(&d.vpx);pthread_mutex_destroy(&d.mu);checked++;
+    cv_clock=saved;return checked;
+}
 int main(void) {
+    if(getenv("MNG_CLOCK_NEGATIVE"))setenv("DM_CV_LATE","0",1);
+    unsigned clocks=movie_clock_cases();
     for(int form=0;form<3;form++){run(64,64,red_64_64,sizeof red_64_64,form);run(66,48,red_66_48,sizeof red_66_48,form);}
-    printf("{\"status\":\"pass\",\"cases\":6,\"forms\":3,\"events_destroyed\":%u,\"native_writes\":%u}\n",destroyed,prepared);
+    printf("{\"status\":\"pass\",\"cases\":6,\"forms\":3,\"events_destroyed\":%u,\"native_writes\":%u,\"movie_clock_checks\":%u}\n",destroyed,prepared,clocks);
 }

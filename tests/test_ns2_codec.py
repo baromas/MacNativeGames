@@ -35,3 +35,4 @@ class NS2Codec(unittest.TestCase):
                 self.assertEqual(result['cases'], 6)
                 self.assertEqual(result['events_destroyed'], 12)
                 self.assertEqual(result['native_writes'], 8)
+                self.assertGreaterEqual(result['movie_clock_checks'], 90)
