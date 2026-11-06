@@ -24,3 +24,18 @@ text execution progress; visual correctness still needs the user's report.
 Validation of this combined checkpoint: all eight Mac runtime targets compile, both changed Objective-C files
 pass iOS syntax checks, and the root suite passes (1,478 tests, 164 skipped, no failures/errors). The existing
 production driver c0/c2 GPU probe passes 102 checks. These checks do not establish the unknown word's semantics.
+
+## Bounded game trial with the switch
+
+The combined sRGB build with the explicit diagnostic reached first present at 3.139 s, AV1 decode, repeated movie
+compute passes and the experimental word's load. The user reports a **black screen with music and the FPS counter
+still running**. The text trace records all 13 NDVE dispatches and real image bindings, followed by sampling of its
+sRGB output. This establishes execution/binding progress, not correct image contents.
+
+The process did not hit the prior c0+0x640 abort during this trial. The local helper terminated its own process at
+80.27 s (75 seconds after observing first present), exit SIGTERM, not an application crash. No game-window pixels
+were read or captured. Full video correctness is still unresolved; zero must not be promoted to a verified default.
+
+Next investigation: NDVE reconstruction and raw-memory data propagation, against nxnative's current implementation.
+Upstream #1331 offers an opt-in bilinear diagnostic substitute for NDVE. It is not imported/enabled here and is not
+a quality-preserving fix. The upstream write-log bitmap/chunk hints are not ported yet either.

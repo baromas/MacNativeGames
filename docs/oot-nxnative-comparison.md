@@ -47,3 +47,14 @@ our M3 Pro or this MacNativeGames stack. The v131072 main BuildID matches this u
 
 Installed TOTK is outside this experiment and remains untouched. No game content or generated game shaders are
 published. Current code branches are on baromas/MacNativeGames; no new PR or merge was requested.
+
+## Later source-level cross-check
+
+Current nxnative's LDSM calls `ALocalAddress(..., stride: false)`; its helper defaults to scaling. This checkout's
+helper instead defaults `shared=false` and therefore already leaves that LDSM address unscaled. Copying the new
+argument mechanically would confuse opposite parameter meanings. No address-scaling change is warranted from
+that diff alone. The separately added subgroup-ordering barriers remain a distinct change.
+
+After event/image/sRGB fixes, the explicit c0+0x640 experiment avoids the previous load abort but the user reports
+black video with ongoing music/FPS. The text trace executes the movie passes and real bindings; correct content
+cannot be established from those metadata alone. See `oot-driver-zero-experiment.md` for the actual bounded trial.
