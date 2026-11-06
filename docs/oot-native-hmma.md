@@ -25,3 +25,5 @@ The LightEvent-wrapper test verifies all original calls, the full 64-bit timeout
 The first combined unit run had a timeout-fixture error (its fake tar never wrote its PID under concurrent build load). The final suite is run again after builds complete; no change to the archive tests is made.
 
 Final combined validation: 1482 tests, 165 skipped, no failures/errors (238.442 s), with heavy builds complete before the suite. All eight Mac runtime targets build, and base/NS2 host syntax checks pass for iOS. The independent device-property probe is recorded below after its run. Whole-game visual output remains to be confirmed in one new launch.
+
+Production-thunk `probe-nvn-properties` passed on OoT (NVN major 231, minor 40). The single follow-up launch uses v12, standard NDVE and a fresh isolated shader cache. The text-only audit confirms native matrix code in the newly generated movie shaders; image output is pending user confirmation. The existing explicit c0+0x640-zero diagnostic remains enabled only by the local launcher. No direct-movie scaling is enabled.
