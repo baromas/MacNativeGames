@@ -1,5 +1,14 @@
 # The shader translator, ready-made
 
+Patch 0008 (2026-11-06) adds subgroup barriers around Ampere LDSM shared-memory reads, adapted from nxnative
+`2d6f86f8` / PR #1376. The Mac executable and iOS static library were rebuilt from the patched sources with .NET
+SDK 10.0.401. A constructed program in both matrix layouts fails against the previous executable (zero barriers)
+and passes against the rebuilt one (two barriers, correct scopes/semantics around the shared loads). SPIRV-Cross
+emits the corresponding two Metal threadgroup-memory SIMD barriers, and the Metal compiler accepts both programs.
+Four non-LDSM synthetic service requests (DebugMode on/off) retain byte-identical SPIR-V, MSL and reflection. This is
+not a whole-game shader regression or proof that OoT's pink movie output is fixed. The translation chain is now
+`totk-native-v10-ldsm-order`, so stale generated shaders are not reused under the normal cache path.
+
 `totk_xlate` is the program the game starts to translate its shaders (`totk_xlate --service`): the Ryujinx shader
 translator (`vendor/ryujinx`, MIT) with this project's patches (`games/totk/tools/totk_xlate/patches`) and the service
 (`games/totk/tools/totk_xlate/Service.cs`: Maxwell code -> SPIR-V -> SPIRV-Cross -> Metal Shading Language and its

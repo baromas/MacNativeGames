@@ -1,0 +1,23 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitAmpereTensor.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitAmpereTensor.cs
+@@ -260,6 +260,11 @@
+             int id = context.ResourceManager.SharedMemoryId;
+             Operand[] results = new Operand[count];
+
++            // Adapted from nxnative 2d6f86f8 (MIT): LDSM collectively reads rows written by other lanes. Metal needs
++            // an execution/memory barrier before those reads, and one after them before the next store reuses the rows.
++            // The whole subgroup participates in LDSM, as required by these subgroup-scoped barriers.
++            context.SubgroupBarrier();
++
+             for (int m = 0; m < count; m++)
+             {
+                 if (mode == 0)
+@@ -286,6 +291,8 @@
+                 }
+             }
+
++            context.SubgroupBarrier();
++
+             for (int m = 0; m < count && x.Rd + m < RegisterConsts.RegisterZeroIndex; m++)
+             {
+                 context.Copy(Register(x.Rd + m, RegisterType.Gpr), results[m]);
