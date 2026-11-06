@@ -43,3 +43,5 @@ Fetched or linked at build time (not in this repository):
 | [OpenCC](https://github.com/BYVoid/OpenCC), run (not included) by `windows_games/ra2/scripts/languages.py` | Traditional to Simplified Chinese | Apache-2.0 |
 
 OoT direct-movie diagnostic (`games/totk/third_party/d2r_gfx/gfx/nvn/oot_movie_direct.inc`): matching and submission-lifetime strategy adapted from [nxnative PR #1331](https://github.com/seedds/nxnative/pull/1331), revision `76c20edba480db753ce7092cd2677f6c4a8daa15`, MIT (`games/totk/third_party/licenses/nxnative.txt`). The local bilinear compute kernel and synthetic probe are original code.
+
+NVN2 push-bank reflection in `nvn_refl.m`: bank-24 distinction compared with nxnative `dm/gfx/nvn/nvn_refl.m` at `ee9b7765d579c46e45a7297493565e098f3bda33` (MIT; `games/totk/third_party/licenses/nxnative.txt`), routed through this runtime's existing CBUF/push snapshot representation.

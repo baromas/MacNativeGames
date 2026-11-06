@@ -131,8 +131,7 @@ typedef struct { int32_t n; const tex_t *color[8]; view_t cview[8]; uint8_t has_
 typedef struct { int32_t index, mask; float rgba[4]; } p_clear_color;
 /* NVN2 push constants (nvnCommandBufferPushGraphicsConstants / PushComputeConstants): bytes at offset of the graphics or the
    compute block, which their shaders read as c[24] (NVN_PUSH_BANK; the translator maps NVN2 compute's c0 push region there). */
-#define NVN_PUSH_BANK 24
-#define NVN_PUSH_SIZE 0x100
+#include "nvn_push.h"
 typedef struct { uint16_t compute, offset; uint32_t size; uint8_t data[]; } p_push_const;
 typedef struct { void *sync; } p_fence_sync;   // nvnCommandBufferFenceSync: the sync object, fenced at the submit (hle_nvn.c fence_syncs)
 #ifdef GAME_BOTW

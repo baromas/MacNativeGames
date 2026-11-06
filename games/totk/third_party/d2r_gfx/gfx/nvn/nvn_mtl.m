@@ -18714,9 +18714,10 @@ int mtl_probe_ubo_snapshot(void) {
    scan (drv_scan) must find the read. A 5x3x1 dispatch must write all 15 cells with {5, 3, 1, tag}. Also checks the scan of
    vertex reads (storage table, point-size limit) and that it reports unfillable words. TOTK_DRV_FILL=0 (the old all-zero
    segment) must fail: every cell lands in the first row and the counts read 0. */
+#include "nvn_push_probe.inc"
 int mtl_probe_drv_c0(void) {
     driver_cache_set(1); // exercise the opt-in cache as well as the driver-bank contents
-    mtl_init(); int checked = 0;
+    mtl_init(); int checked = probe_push_constants();
     static const char *msl =
         "#include <metal_stdlib>\nusing namespace metal;\n"
         "struct _16 { float4 _m0[4096]; };\nstruct _23 { uint _m0[1]; };\n"

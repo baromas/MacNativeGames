@@ -158,7 +158,7 @@ verify-boot: runtime
 
 
 
-GFX_HEADERS := third_party/d2r_gfx/gfx/nvn/oot_movie_direct.inc third_party/d2r_gfx/gfx/nvn/oot_movie_probe.inc $(wildcard third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h zeldaVR/gfx/*.h zeldaVR/runtime/*.h)
+GFX_HEADERS := third_party/d2r_gfx/gfx/nvn/nvn_push_probe.inc third_party/d2r_gfx/gfx/nvn/oot_movie_direct.inc third_party/d2r_gfx/gfx/nvn/oot_movie_probe.inc $(wildcard third_party/d2r_gfx/gfx/nvn/*.h third_party/d2r_gfx/gfx/nvn/include/*.h third_party/d2r_gfx/host/*.h zeldaVR/gfx/*.h zeldaVR/runtime/*.h)
 
 build/gfx/%.o: % $(GFX_HEADERS) Makefile
 	@mkdir -p "$(dir $@)"

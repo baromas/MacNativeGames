@@ -1,6 +1,7 @@
 // 着色器反射 json（B：Switch 原版翻译，tools/dmsh_build.py 出）→ 定长 C 数组（nvn_refl.h）
 // Shader reflection json (B: produced by translating the original Switch shaders, output of tools/dmsh_build.py) → fixed-length C arrays (nvn_refl.h)
 #import "nvn_refl.h"
+#include "nvn_push.h"
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <string.h>
@@ -54,7 +55,13 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
             else if ([k isEqualToString:@"sbuf_ubo"]) { r->kind = NVN_RB_SBUFU; r->rw = refl_rw(b); r->off = (uint16_t)[b[@"off"] intValue]; }
             else if ([k isEqualToString:@"support"]) r->kind = NVN_RB_SUPPORT;
             else if ([k isEqualToString:@"c1"]) r->kind = NVN_RB_C1;
-            else if ([k isEqualToString:@"drvcb"]) r->kind = [b[@"bank"] intValue] == 2 ? NVN_RB_DRV2 : NVN_RB_DRV0;
+            else if ([k isEqualToString:@"drvcb"]) {
+                /* c24 is the NVN2 push block, not driver c0. The translator's existing JSON already records bank 24;
+                   keep old shader caches valid and route it to the replay's existing immutable push snapshot.
+                   nxnative nvn_refl.m uses the same distinction (MIT, ee9b7765d579c46e45a7297493565e098f3bda33). */
+                if ([b[@"bank"] intValue] == NVN_PUSH_BANK) { r->kind = NVN_RB_CBUF; reg = r->reg = NVN_PUSH_BANK; }
+                else r->kind = [b[@"bank"] intValue] == 2 ? NVN_RB_DRV2 : NVN_RB_DRV0;
+            }
             else if ([k isEqualToString:@"gmem_map"]) r->kind = NVN_RB_GMEM;
             else if ([k isEqualToString:@"geometry"]) { r->kind = NVN_RB_GEO; if (reg < 0 || reg > 4) FAIL("geometry helper %s: reg %d", [b[@"msl_name"] UTF8String], reg); }
             else if ([k isEqualToString:@"gmem_log"]) { r->kind = NVN_RB_GMEML; r->rw = 1; }

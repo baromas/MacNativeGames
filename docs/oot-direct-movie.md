@@ -13,3 +13,5 @@ This deliberately substitutes simpler scaling for NDVE reconstruction. It is **n
 - On M3 Pro / macOS 27, the bounded v131072 game run reached the replacement and ran until the helper stopped it at 80.52 seconds; no crash. The user reported black video with music/FPS followed by the Zelda logo and menu. Video is **not fixed**. No live window or game texture pixels were read.
 
 The next comparison found bank c24 being parsed as driver c0 despite the replay already supporting NVN2 push constants. That issue is investigated separately, without treating this workaround as its fix.
+
+Combined validation with the subsequent c24 fix: 1479 tests / 165 skipped, no errors, all eight Mac runtime targets built and changed Objective-C files passed iOS syntax checks. A complete iOS app/device run is still unverified.
