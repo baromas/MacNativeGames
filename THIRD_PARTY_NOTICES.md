@@ -4,6 +4,7 @@ Code in this repository that comes from other projects keeps its license; the li
 
 | Code | From | License | File |
 |---|---|---|---|
+| Writable-image preparation in `games/totk/third_party/d2r_gfx/gfx/nvn/nvn_mtl.m`, reimplemented using this renderer's storage-upgrade machinery | [nxnative PR #1299](https://github.com/seedds/nxnative/pull/1299), revision `ee9b7765d579c46e45a7297493565e098f3bda33`, `image_prepare` / `img_binding` | MIT | `games/totk/third_party/licenses/nxnative.txt` |
 | LDSM subgroup memory ordering in `games/totk/tools/totk_xlate/patches/0008-ldsm-subgroup-barriers.patch` | [nxnative PR #1376](https://github.com/seedds/nxnative/pull/1376), commit `2d6f86f819c4b80ed4bbd80c66aa623e6e7dc85f`, adapted | MIT | `games/totk/third_party/licenses/nxnative.txt` |
 | `games/totk/runtime/ns2_av1.c`, `.h`; SDK 22 adapters/native image delivery in `runtime/ns2_codec.c`; `third_party/d2r_gfx/gfx/nvn/ns2_native_image.c` and device property `0x67` | [nxnative](https://github.com/seedds/nxnative/tree/865cc35fad7034d17c2190f8ce349f61f5bcaba1), commit `865cc35f`, adapted to this runtime | MIT | `games/totk/third_party/licenses/nxnative.txt` |
 | dav1d 1.5.4, downloaded with a pinned SHA256 and linked statically into Mac Switch 2 runtimes by `games/totk/scripts/build_dav1d.py` | [VideoLAN dav1d](https://code.videolan.org/videolan/dav1d/-/tree/1.5.4) | BSD-2-Clause | `games/totk/third_party/licenses/dav1d.txt` (also copied into NS2 apps by runtime packaging/updates) |

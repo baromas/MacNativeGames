@@ -3344,16 +3344,16 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
 // 计数：选角 / 营地 / 野外 / 战斗 4 页 17473 张贴图换格式视图 0 次，所以这里是兜底，不靠预测哪些贴图需要
 // In-place upgrade: when the original texture was not created with PixelFormatView (off by default, to keep Apple GPU lossless compression) but a different-format view is needed, create a new one with the original spec + PixelFormatView, copy over every slice × level, and replace the registration.
 // Count: across the 4 screens character select / camp / wilderness / combat, 17473 textures needed a different-format view 0 times, so this is a fallback and does not rely on predicting which textures need it
-static id<MTLTexture> tex_upgrade_pfv(const tex_t *t, id<MTLTexture> base, MTLPixelFormat view_pf) {
+static id<MTLTexture> tex_upgrade_usage(const tex_t *t, id<MTLTexture> base, MTLTextureUsage extra, MTLPixelFormat view_pf) {
     if (g_tex_preparing && rp_active()) { g_tex_prepare_split = 1; return base; }
     { stor_key k;   // TOTK: a storage-shared base is recreated for every serial holding it, then this serial re-resolves
-      if (stor_key_lookup(base, &k)) { if (!stor_recreate(&k, base.usage | MTLTextureUsagePixelFormatView)) return base; id<MTLTexture> nb = tex_mtl(t); return nb ? nb : base; } }
+      if (stor_key_lookup(base, &k)) { if (!stor_recreate(&k, base.usage | extra)) return base; id<MTLTexture> nb = tex_mtl(t); return nb ? nb : base; } }
     MTLTextureDescriptor *d = [MTLTextureDescriptor new];
     d.textureType = base.textureType; d.pixelFormat = base.pixelFormat; d.width = base.width; d.height = base.height; d.depth = base.depth;   // 保留原格式，只加换格式视图用途 | Keep the original format, only add the format-view usage
     d.swizzle=base.swizzle;
     d.arrayLength = base.arrayLength; d.mipmapLevelCount = base.mipmapLevelCount; d.sampleCount = base.sampleCount;
     d.storageMode = base.storageMode; d.cpuCacheMode = base.cpuCacheMode; d.hazardTrackingMode = base.hazardTrackingMode;
-    d.resourceOptions = base.resourceOptions; d.usage = base.usage | MTLTextureUsagePixelFormatView;
+    d.resourceOptions = base.resourceOptions; d.usage = base.usage | extra;
     id<MTLTexture> upgraded = [g_dev newTextureWithDescriptor:d];
     if (!upgraded) { RED_ONCE(45, "贴图升级失败 ser=%llu 格式 %lu → %lu", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf); return base; }
     res_add(upgraded);
@@ -3369,9 +3369,13 @@ static id<MTLTexture> tex_upgrade_pfv(const tex_t *t, id<MTLTexture> base, MTLPi
     id holder = serial_get(t->serial);
     if ([holder isKindOfClass:[NvPkg class]]) { id<MTLTexture> old = ((NvPkg *)holder)->tex; ((NvPkg *)holder)->tex = upgraded; memset(&((NvPkg *)holder)->key, 0, sizeof(reup_key)); defer_obj_release(old); ser_bump(t->serial); }   // key 0: the upgraded texture is not recycled
     else serial_put(t->serial, upgraded);
-    MLOG("贴图升级为可换格式视图 ser=%llu 基格式 %lu → 视图格式 %lu（升级次数=%llu）", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, ++g_pfv_upgrades);
+    MLOG("texture usage upgraded ser=%llu format=%lu view=%lu usage=%#lx (count=%llu)", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, (unsigned long)d.usage, ++g_pfv_upgrades);
     return upgraded;
 }
+static id<MTLTexture> tex_upgrade_pfv(const tex_t *t, id<MTLTexture> base, MTLPixelFormat view_pf) {
+    return tex_upgrade_usage(t, base, MTLTextureUsagePixelFormatView, view_pf);
+}
+
 static int stor_key_lookup(id o, stor_key *k) {
     if (!o) return 0; uint64_t ok = obj_key(o);
     pthread_mutex_lock(&g_smu); stor_ent *e = nvn_hm_get(&g_stor_of_obj, &ok); if (e) *k = e->k; pthread_mutex_unlock(&g_smu);
@@ -6808,6 +6812,31 @@ static inline __attribute__((always_inline)) uint64_t tex_fast_rid(int tid, void
     }
     void *t=tex_fast(tid);if(out)*out=t;
     return t?((__bridge id<MTLTexture>)t).gpuResourceID._impl:0;
+}
+/* Image bindings establish write use even when the guest did not supply the optional IMAGE allocation hint.
+   Upgrade a plain RGBA8 surface on the GPU timeline, preserving its content and all cached sampling views. Other
+   previously unsupported formats retain the explicit failure path until their image-write behavior is validated.
+   Called with the registry lock; preparation asks for a render-pass split before any recreation under an open pass. */
+static int g_image_usage_probe_negative;
+static uint64_t tex_image_rid(int tid, void **out, int writes) {
+    __unsafe_unretained id<MTLTexture> view = tid > 0 ? (__bridge id<MTLTexture>)tex_by_id_p(tid) : nil;
+    if (writes && !g_image_usage_probe_negative && view && !(view.usage & MTLTextureUsageShaderWrite) && tid < g_ntreg && g_treg[tid].ok &&
+        view.pixelFormat == MTLPixelFormatRGBA8Unorm && view.sampleCount == 1 &&
+        swizzle_eq(view.swizzle, MTLTextureSwizzleChannelsDefault)) {
+        tex_t *t = &g_treg[tid].t;
+        id<MTLTexture> base = tex_mtl(t);
+        if (base && base.pixelFormat == MTLPixelFormatRGBA8Unorm && swizzle_eq(base.swizzle, MTLTextureSwizzleChannelsDefault)) {
+            unsigned flags = t->d.flags; t->d.flags |= NVN_TEXTURE_FLAGS_IMAGE;
+            id<MTLTexture> upgraded = tex_upgrade_usage(t, base, MTLTextureUsageShaderWrite, base.pixelFormat);
+            if (g_tex_prepare_split) { if (out) *out = NULL; return 0; }
+            if (upgraded.usage & MTLTextureUsageShaderWrite) {
+                treg_clear_view_locked(tid);
+                view = (__bridge id<MTLTexture>)tex_by_id_p(tid);
+            } else t->d.flags = flags;
+        }
+    }
+    if (out) *out = (__bridge void *)view;
+    return view ? view.gpuResourceID._impl : 0;
 }
 /* A texture bound to a slot its shader reads by integer texel coordinates (refl_mark_fetches) whose Metal copy left out
    the top mip level (mip_drop_of, the iPhone): kept at full size from now on (NvPkg keep_full) and uploaded again at once
@@ -10464,12 +10493,19 @@ static int encode_args(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, in
             USE(t, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_IMG) {   // 可写贴图：NVN 图像槽 r（BindImages）↔ D3D u_r | Writable texture: NVN image slot r (BindImages) ↔ D3D u_r
             int tid = reg < 32 ? (int)(S.img[nvn_stage][reg] & 0xfffff) : 0;
-            void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
+            void *tv = NULL; uint64_t trid = tid ? tex_image_rid(tid, &tv, b->rw) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
             if (passdump()) PD("W %llu st%d reg%d tid=%d %s ser=%llu", g_stat_pass, nvn_stage, reg, tid, t ? "实" : "哑", t && tid < g_ntreg ? g_treg[tid].t.serial : 0ull);
-            if (t && !(t.usage & MTLTextureUsageShaderWrite)) { RED_ONCE(32, "图像槽绑的贴图没有可写用途（贴图号 %d）", tid); t = nil; }
+            if (t && b->rw && !(t.usage & MTLTextureUsageShaderWrite)) {
+                const tex_t *it = tid > 0 && tid < g_ntreg ? &g_treg[tid].t : NULL;
+                RED_ONCE(32, "image texture has no shader-write usage: id=%d ser=%llu flags=%#x format=%#x usage=%#lx layout=%d pool_flags=%#x",
+                         tid, (unsigned long long)(it ? it->serial : 0), it ? it->d.flags : 0, it ? it->d.format : 0,
+                         (unsigned long)t.usage, it ? it->has_layout : 0, it && it->pool ? it->pool->flags : 0);
+                t = nil;
+            }
             if (!t) { t = dummy_img(b->dtt, b->dpf); trid = g_dummy_img_rid[b->dtt & 7][b->dpf & 3]; }   // 未绑：D3D 语义写入丢弃——写进专用哑贴图，不污染读出 0 的那套 | Unbound: D3D semantics discard the write - write into a dedicated dummy texture so the set that reads 0 is not polluted
             slots[aid] = trid;
-            USE(t, MTLResourceUsageRead | MTLResourceUsageWrite);
+            USE(t, MTLResourceUsageRead | (b->rw ? MTLResourceUsageWrite : 0));
+            if (b->rw && tv && t == (__bridge id<MTLTexture>)tv && tid > 0 && tid < g_ntreg) gpu_owned_mark(g_treg[tid].t.serial);
         } else if (b->kind == NVN_RB_TBUF) {   // 类型化缓冲：贴图槽 r 里的缓冲贴图（目标 BUFFER） | Typed buffer: the buffer texture (target BUFFER) in texture slot r
             int tid = reg < 128 ? (int)(S.tex[nvn_stage][reg] & 0xfffff) : 0;
             void *tv = NULL; uint64_t trid = tid ? tex_fast_rid(tid, &tv) : 0; __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv;
@@ -12748,13 +12784,17 @@ static void prepare_draw_textures(NvProg *pr) {
         registry_lock();
         for (int st = 0; st < 2; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
             int count = planned ? sh->texture_count : sh->rf.nb;
-            for (int i = 0; i < count; i++) { int tid = 0;
-                if (planned) { unsigned slot = sh->texture_slots[i]; tid = (int)((slot < 128 ? S.tex[st][slot] : S.img[st][slot - 128]) & 0xfffff); }
+            for (int i = 0; i < count; i++) { int tid = 0, image = 0;
+                if (planned) {
+                    unsigned slot = sh->texture_slots[i];
+                    if (slot >= 128) for (int j=0;j<sh->rf.nb;j++) if(sh->rf.b[j].kind==NVN_RB_IMG&&sh->rf.b[j].reg==slot-128&&sh->rf.b[j].rw){image=1;break;}
+                    tid = (int)((slot < 128 ? S.tex[st][slot] : S.img[st][slot - 128]) & 0xfffff);
+                }
                 else { const nvn_rbind *b = &sh->rf.b[i];
                     if ((b->kind == NVN_RB_TEX || b->kind == NVN_RB_TBUF) && b->reg < 128) tid = (int)(S.tex[st][b->reg] & 0xfffff);
-                    else if (b->kind == NVN_RB_IMG && b->reg < 32) tid = (int)(S.img[st][b->reg] & 0xfffff);
+                    else if (b->kind == NVN_RB_IMG && b->reg < 32) { image = b->rw; tid = (int)(S.img[st][b->reg] & 0xfffff); }
                 }
-                if (tid > 0) (void)tex_fast(tid);
+                if (tid > 0) { if (image) (void)tex_image_rid(tid, NULL, 1); else (void)tex_fast(tid); }
                 if (g_tex_prepare_split) break;
             }
             if (g_tex_prepare_split) break;
@@ -14963,6 +15003,16 @@ static void dispatch(const p_dispatch *dp) {
     const uint16_t *tg = cs->rf.tg;
     if (!tg[0]) { RED_ONCE(29, "计算着色器缺线程组大小反射"); return; }
     rp_end();
+    /* Resource creation/copy must precede the compute encoder too, including the non-reused encoder path. */
+    registry_lock();
+    for (int i = 0; i < cs->rf.nb; i++) {
+        const nvn_rbind *b = &cs->rf.b[i];
+        if (b->kind == NVN_RB_IMG && b->reg < 32 && b->rw) {
+            int tid = (int)(S.img[5][b->reg] & 0xfffff);
+            if (tid > 0) (void)tex_image_rid(tid, NULL, 1);
+        }
+    }
+    registry_unlock();
     int reuse = disp_reuse_on() && !pg_on();
     /* TOTK_DISP_PREARGS (default on): when this dispatch opens the compute encoder after a streamed render pass, disp_enc
        first waits for the encode stage to finish that pass (rs_sync, ~5% of the replay in the world). The dispatch's
@@ -18148,6 +18198,99 @@ int mtl_probe_linear_rt_upload(void) {
         memset(&R,0,sizeof R);mtl_tex_release(&t);mtl_pool_del(mem);nvn_dirty_remove_range(mem);mtl_finish();res_remove(rb);munmap(mem,size);free(pixels);
     }
     return checked;
+}
+
+/* An image binding without the optional IMAGE hint must gain write usage without losing the previous texture
+   contents or leaving an already cached sampling descriptor on the old copy. Synthetic data only. */
+int mtl_probe_image_usage(void) {
+    mtl_init(); int checked = 0;
+    const char *negative = getenv("TOTK_PROBE_NEGATIVE"); g_image_usage_probe_negative = negative && atoi(negative) == 31;
+    NSError *error = nil;
+    NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\nstruct A { texture2d<float,access::write> out [[id(0)]]; }; kernel void fill(constant A &a [[buffer(0)]], uint2 p [[thread_position_in_grid]]) { if(p.x>=8&&p.x<a.out.get_width()&&p.y<a.out.get_height()) a.out.write(float4(.25,.5,.75,1),p); }\nstruct B { texture2d<float,access::read> input_tex [[id(0)]]; device float4 *dst [[id(1)]]; }; kernel void readback(constant B &a [[buffer(0)]], uint2 p [[thread_position_in_grid]]) { if(p.x<16&&p.y<16) a.dst[p.y*16+p.x]=a.input_tex.read(p); }\n";
+    id<MTLLibrary> lib = [g_dev newLibraryWithSource:source options:nil error:&error];
+    if (!lib) MDIE("image usage probe shader: %s", error.localizedDescription.UTF8String);
+    enum { W=16, H=16, BYTES=W*H*4 };
+    const uint8_t original[4] = {17,43,79,255};
+    for (int mode=0; mode<2; mode++) {
+        tex_t t={0}; t.serial=0xffffff90+mode*4;
+        t.d=(nvn_texdesc){.width=W,.height=H,.depth=1,.levels=1,.target=1,.format=0x25,
+            .swizzle_r=2,.swizzle_g=3,.swizzle_b=4,.swizzle_a=5};
+        nvn_tex_layout(&t.d,&t.L); size_t size=(t.L.size+getpagesize()-1)&~((size_t)getpagesize()-1);
+        void *mem=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0); if(mem==MAP_FAILED)MDIE("image usage mmap");
+        uint8_t pixels[BYTES];for(int i=0;i<BYTES;i++)pixels[i]=original[i%4];
+        if(nvn_swizzle(&t.d,0,0,pixels,W*4,mem))MDIE("image usage swizzle");
+        pool_t pool={.mem=mem,.size=size,.flags=0x24};t.mem=mem;t.pool=&pool;
+        mtl_pool_add(mem,size);nvn_dirty_add_range(mem,size);
+        op_hdr end={OP_END,8};id<MTLBuffer> rb=probe_buf(BYTES*3);
+        mtl_sub_begin();mtl_exec((const uint8_t *)&end);
+        view_t view={.set_levels=1,.nlevels=1};mtl_reg_tex(1,&t,NULL);mtl_reg_tex(2,&t,&view);
+        registry_lock();id<MTLTexture> old=tex_by_id(1), old_view=tex_by_id(2);registry_unlock();
+        if(!old||!old_view||(old.usage&MTLTextureUsageShaderWrite))MDIE("image usage fixture must start read-only");
+        enc_b_copy_texture_buffer(blit(),old,0,0,MTLOriginMake(0,0,0),MTLSizeMake(W,H,1),rb,0,W*4,BYTES);
+        mtl_sub_commit();mtl_finish();
+        for(int i=0;i<BYTES;i++){if(((uint8_t *)rb.contents)[i]!=original[i%4])MDIE("image usage cold upload byte %d",i);checked++;}
+        NvShader *sh=[NvShader new];sh->fn=[lib newFunctionWithName:@"fill"];sh->stage=5;
+        snprintf(sh->key,sizeof sh->key,"probe-image-usage-%d",mode);
+        sh->rf.nb=1;sh->rf.b[0]=(nvn_rbind){.kind=NVN_RB_IMG,.aid=0,.reg=0,.rw=1,.dtt=MTLTextureType2D};
+        sh->rf.tg[0]=8;sh->rf.tg[1]=8;sh->rf.tg[2]=1;
+        sh->ae=[sh->fn newArgumentEncoderWithBufferIndex:0];sh->arg_len=sh->ae.encodedLength;
+        NvProg *np=[NvProg new];np->sh[5]=sh;prog_t program={.serial=t.serial+1};serial_put(program.serial,np);
+        mtl_sub_begin();mtl_exec((const uint8_t *)&end);S.img[5][0]=1;S.cprog=&program;
+        if(mode){
+            memset(&R,0,sizeof R);R.has_rt=1;R.rt.n=1;R.rt.color[0]=&t;rp_begin();
+            if(!rp_active())MDIE("image usage fixture must open a render pass");
+            NvProg *draw=[NvProg new];draw->sh[1]=sh;S.img[1][0]=1;
+            prepare_draw_textures(draw);if(!g_image_usage_probe_negative&&rp_active())MDIE("image usage failed render-pass split");
+        }
+        p_dispatch dp={2,2,1,0};dispatch(&dp);
+        registry_lock();id<MTLTexture> output=tex_by_id(1), sampled=tex_by_id(2);registry_unlock();
+        if(!g_image_usage_probe_negative&&(!(output.usage&MTLTextureUsageShaderWrite)||output==old||sampled==old_view))MDIE("image usage failed upgrade or alias invalidation");
+        if(!g_image_usage_probe_negative&&!gpu_owned(t.serial))MDIE("image usage output was not GPU owned");
+        if(t.d.flags&NVN_TEXTURE_FLAGS_IMAGE)MDIE("image usage changed the guest descriptor");
+        enc_b_copy_texture_buffer(blit(),output,0,0,MTLOriginMake(0,0,0),MTLSizeMake(W,H,1),rb,0,W*4,BYTES);
+        enc_b_copy_texture_buffer(blit(),sampled,0,0,MTLOriginMake(0,0,0),MTLSizeMake(W,H,1),rb,BYTES,W*4,BYTES);
+        enc_b_copy_texture_buffer(blit(),old,0,0,MTLOriginMake(0,0,0),MTLSizeMake(W,H,1),rb,BYTES*2,W*4,BYTES);
+        mtl_sub_commit();mtl_finish();
+        for(int i=0;i<BYTES*3;i++){
+            int j=i%BYTES,right=(j/4)%W>=8;
+            int want=i<BYTES*2&&right?(int[]){64,128,191,255}[j%4]:original[j%4];
+            if(abs((int)((uint8_t *)rb.contents)[i]-want)>1)MDIE("image usage GPU mismatch mode%d byte%d got%u want%d",mode,i,((uint8_t *)rb.contents)[i],want);checked++;
+        }
+        mtl_sub_begin();mtl_exec((const uint8_t *)&end);dm_guest_write_prepare(mem,size);((uint8_t *)mem)[size-1]^=0x80;
+        registry_lock();output=tex_by_id(1);registry_unlock();
+        enc_b_copy_texture_buffer(blit(),output,0,0,MTLOriginMake(0,0,0),MTLSizeMake(W,H,1),rb,0,W*4,BYTES);mtl_sub_commit();mtl_finish();
+        for(int i=0;i<BYTES;i++){int right=(i/4)%W>=8,want=right?(int[]){64,128,191,255}[i%4]:original[i%4];if(abs((int)((uint8_t *)rb.contents)[i]-want)>1)MDIE("image usage CPU write restored stale data");checked++;}
+        memset(&R,0,sizeof R);S.cprog=NULL;S.img[5][0]=S.img[1][0]=0;
+        mtl_prog_release(&program);mtl_tex_release(&t);mtl_pool_del(mem);nvn_dirty_remove_range(mem);mtl_finish();res_remove(rb);munmap(mem,size);
+    }
+    /* A read-only image must retain its sampled texture and CPU updates, not become GPU-owned. */
+    if (!g_image_usage_probe_negative) {
+        tex_t t={0};t.serial=0xffffff9c;
+        t.d=(nvn_texdesc){.width=W,.height=H,.depth=1,.levels=1,.target=1,.format=0x25,.swizzle_r=2,.swizzle_g=3,.swizzle_b=4,.swizzle_a=5};
+        nvn_tex_layout(&t.d,&t.L);size_t size=65536;
+        void *mem=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANON,-1,0);if(mem==MAP_FAILED)MDIE("read image mmap");
+        pool_t pool={.mem=mem,.size=size,.flags=0x24};t.mem=mem;t.pool=&pool;mtl_pool_add(mem,size);nvn_dirty_add_range(mem,size);
+        NvShader *sh=[NvShader new];sh->fn=[lib newFunctionWithName:@"readback"];sh->stage=5;snprintf(sh->key,sizeof sh->key,"probe-image-read");
+        sh->rf.nb=2;sh->rf.b[0]=(nvn_rbind){.kind=NVN_RB_IMG,.aid=0,.reg=0,.rw=0,.dtt=MTLTextureType2D};
+        sh->rf.b[1]=(nvn_rbind){.kind=NVN_RB_SBUFP,.aid=1,.reg=0,.rw=1};
+        sh->rf.tg[0]=8;sh->rf.tg[1]=8;sh->rf.tg[2]=1;sh->ae=[sh->fn newArgumentEncoderWithBufferIndex:0];sh->arg_len=sh->ae.encodedLength;
+        NvProg *np=[NvProg new];np->sh[5]=sh;prog_t program={.serial=t.serial+1};serial_put(program.serial,np);
+        op_hdr end={OP_END,8};uint8_t pixels[BYTES];
+        for(int round=0;round<2;round++){
+            dm_guest_write_prepare(mem,size);for(int i=0;i<BYTES;i++)pixels[i]=(uint8_t)(original[i%4]+(i%4==0?round*20:0));
+            if(nvn_swizzle(&t.d,0,0,pixels,W*4,mem))MDIE("read image swizzle");
+            mtl_reg_tex(1,&t,NULL);mtl_sub_begin();mtl_exec((const uint8_t *)&end);
+            S.img[5][0]=1;S.ssbo[5][0]=(p_bind_buf){5,0,(uint64_t)(uintptr_t)mem+32768,W*H*16};S.cprog=&program;
+            p_dispatch dp={2,2,1,0};dispatch(&dp);mtl_sub_commit();mtl_finish();
+            registry_lock();id<MTLTexture> texture=tex_by_id(1);registry_unlock();
+            if((texture.usage&MTLTextureUsageShaderWrite)||gpu_owned(t.serial))MDIE("read-only image was upgraded or marked GPU-owned");
+            const float *got=(const float *)((const uint8_t *)mem+32768);
+            for(int i=0;i<W*H*4;i++){float want=pixels[i]/255.0f;if(fabsf(got[i]-want)>0.00002f)MDIE("read-only image mismatch round%d component%d",round,i);checked++;}
+        }
+        S.cprog=NULL;S.img[5][0]=0;memset(&S.ssbo[5][0],0,sizeof S.ssbo[5][0]);mtl_prog_release(&program);mtl_tex_release(&t);
+        mtl_pool_del(mem);nvn_dirty_remove_range(mem);mtl_finish();munmap(mem,size);
+    }
+    g_image_usage_probe_negative=0;return checked;
 }
 
 /* Reproduce unused descriptor slots holding the old texture after streaming replaces its storage. */
