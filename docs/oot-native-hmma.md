@@ -27,3 +27,9 @@ The first combined unit run had a timeout-fixture error (its fake tar never wrot
 Final combined validation: 1482 tests, 165 skipped, no failures/errors (238.442 s), with heavy builds complete before the suite. All eight Mac runtime targets build, and base/NS2 host syntax checks pass for iOS. The independent device-property probe is recorded below after its run. Whole-game visual output remains to be confirmed in one new launch.
 
 Production-thunk `probe-nvn-properties` passed on OoT (NVN major 231, minor 40). The single follow-up launch uses v12, standard NDVE and a fresh isolated shader cache. The text-only audit confirms native matrix code in the newly generated movie shaders; image output is pending user confirmation. The existing explicit c0+0x640-zero diagnostic remains enabled only by the local launcher. No direct-movie scaling is enabled.
+
+## User-confirmed first output
+
+In the v131072 v12 launch on M3 Pro, video appeared after approximately five minutes; the menu then rendered normally and input responded. The initial text-only sample was blocked in newComputePipelineState while MTLCompilerService used 100% CPU. Shader preparation progressed from 12 to 30 variants. This establishes visible movie/menu output after native HMMA and guarded-write fixes, not verified full gameplay.
+
+The user reported the video silent and possibly slow/delayed. Audio had continued during the compilation stall and later reached silence in the log. Cold compilation can therefore account for initial displacement; steady-state movie clock handling is still pending. nxnative PR1379 addresses sequential movie pictures running too slowly below 60 rendered FPS, but has not yet been imported. The next checks are a warm-cache startup and the first 3D scene. No game image or texture pixels were inspected by the agent.
