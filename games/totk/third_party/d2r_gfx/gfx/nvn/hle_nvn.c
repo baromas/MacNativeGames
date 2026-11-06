@@ -201,6 +201,11 @@ static const int g_devinfo[] = {
     [0x5D] = 4096, [0x5E] = 128, [0x5F] = 4096,
 };
 NVN(nvnDeviceGetInteger, void, const NVNdevice *d, NVNdeviceInfo what, int *out) {
+#ifdef GAME_NS2
+    /* NVN2 shader control/code alignment, as served by nxnative 865cc35f (MIT). The movie library asks this before
+       loading NDVE programs. Our page-aligned shader storage satisfies the required 256-byte alignment. */
+    if ((unsigned)what == 0x67) { *out = 256; return; }
+#endif
     (void)d;
     unsigned w = (unsigned)what;
     // 0x5F 分离采样器绑定数、0x60/0x61 在 SMO 实测表里没有：0x5F 按采样器池上限给 4096 未核，0x60/0x61 报红给 0

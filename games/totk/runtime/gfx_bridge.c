@@ -68,6 +68,10 @@ static int watch_fault(void *addr,int is_write,void *context){
 int runtime_gfx_fault(void *addr,int is_write,void *context){if(watch_fault(addr,is_write,context))return 1;return fault_hook?fault_hook(addr,is_write,context):0;}
 void crash_set_wait_dump(void (*fn)(void)){(void)fn;}
 void *runtime_gfx_override(const char *name){
+#ifdef GAME_NS2
+ extern void *nvn_native_image_override(const char *name);
+ void *native=nvn_native_image_override(name);if(native)return native;
+#endif
  unsigned long size=0;const GfxEntry *entries=(void *)getsectiondata(&_mh_execute_header,"__DATA","totkgfx",&size);
  for(unsigned i=0;entries&&i<size/sizeof(*entries);i++)if(!strcmp(entries[i].name,name))return entries[i].fn;return NULL;
 }

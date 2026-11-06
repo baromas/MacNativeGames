@@ -1427,6 +1427,9 @@ def place_runtime(tree, app, version, logs, *, game='totk', lists=True):
     clone(tree / ('build/totk-native' if version == 'v0' else f'build/totk-native-{version}'), res / 'build/totk-native')
     clone(tree / 'build/spirv-cross/spirv-cross', res / 'build/spirv-cross/spirv-cross')
     clone(tree / 'prebuilt/macos-arm64/totk_xlate', res / 'build/shader-service/totk_xlate')   # where totk_shader_rt.m looks for it
+    if version in ('dkb', 'pkp', 'oot'):   # these Mac runtimes statically link the AV1 backend and dav1d
+        for name in ('nxnative.txt', 'dav1d.txt'):
+            clone(tree / 'third_party/licenses' / name, app / 'Contents/Resources/Licenses' / name)
     if lists:
         resolve_lists(tree, res, game, logs)
     clone(tree / 'build/app-launcher', app / f'Contents/MacOS/{APPS[game][2]}')

@@ -367,6 +367,26 @@ class UpdateRuntime(unittest.TestCase):
         self.assertFalse((app / 'Contents/Helpers/ShaderData-v143.bundle').exists())   # it would break the old seal
         self.assertTrue((failed / 'Contents/Helpers/ShaderData-v143.bundle').is_dir())
 
+    def test_ns2_runtime_packaging_replaces_av1_license_notices(self):
+        tree = self.root / 'tree'
+        for version in ('dkb', 'pkp', 'oot'):
+            rel = f'build/totk-native-{version}'
+            (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+            (tree / rel).write_bytes(b'native runtime')
+        for rel in ('build/spirv-cross/spirv-cross', 'prebuilt/macos-arm64/totk_xlate', 'build/app-launcher',
+                    'third_party/licenses/nxnative.txt', 'third_party/licenses/dav1d.txt'):
+            (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+            (tree / rel).write_bytes(rel.encode())
+        for version in ('dkb', 'pkp', 'oot'):
+            with self.subTest(version=version):
+                app = self.root / f'{version}.app'
+                notices = app / 'Contents/Resources/Licenses'
+                notices.mkdir(parents=True)
+                (notices / 'dav1d.txt').write_text('old notice')
+                build_app.place_runtime(tree, app, version, self.root / 'logs', lists=False)
+                for name in ('nxnative.txt', 'dav1d.txt'):
+                    self.assertEqual((notices / name).read_bytes(), (tree / 'third_party/licenses' / name).read_bytes())
+
     def test_place_runtime_replaces_only_the_runtime(self):
         app, res, _ = self.app()
         tree = self.root / 'tree'
