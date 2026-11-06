@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 // 哑贴图类型：与原 dummy_tex 同一套前缀判定（未绑贴图槽按 D3D 语义读出 0）
 // Dummy texture type: same prefix rules as the original dummy_tex (an unbound texture slot reads 0 per D3D semantics)
@@ -75,7 +76,20 @@ int nvn_refl_from_json(NSDictionary *j, nvn_refl *o, char *err, int errlen) {
         NSDictionary *dr = j[@"drv_reads"];
         if ([dr isKindOfClass:[NSDictionary class]]) { o->drv_read[0] = dr[@"0"] != nil; o->drv_read[2] = dr[@"2"] != nil; }
         NSArray *uf = j[@"drv_unfillable"];
-        if ([uf isKindOfClass:[NSArray class]] && uf.count) FAIL("运行时读驱动段的回放层填不了的位置：%s", [[uf componentsJoinedByString:@" "] UTF8String]);
+        if ([uf isKindOfClass:[NSArray class]] && uf.count) {
+#if defined(GAME_OOT)
+            /* Diagnostic only: nxnative currently leaves this VS word zero too, but its meaning is not established.
+               Do not bless the field in the translator or suppress any other missing driver state. The driver bank
+               is already zero-initialized in encode_args. No cached reflection or game shader is edited. */
+            const char *probe = getenv("TOTK_OOT_C0_640_ZERO");
+            int allow = probe && !strcmp(probe, "1") && [j[@"stage"] isEqual:@"vs"] && uf.count == 1 && [uf[0] isEqual:@"c0+0x640"];
+            if (allow) {
+                static int warned;
+                if (!__atomic_exchange_n(&warned, 1, __ATOMIC_RELAXED)) fprintf(stderr, "[nvn-refl] EXPERIMENT: unverified VS c0+0x640 is zero; rendering correctness not established\n");
+            } else
+#endif
+            FAIL("运行时读驱动段的回放层填不了的位置：%s", [[uf componentsJoinedByString:@" "] UTF8String]);
+        }
         NSString *c1 = j[@"c1"];
         if (c1.length % 2 || c1.length / 2 > sizeof o->c1) FAIL("c1 长 %lu 字节，超上限或不成对", (unsigned long)c1.length / 2);
         if (c1.length) { o->has_c1 = 1; o->c1_len = (uint16_t)(c1.length / 2); for (unsigned i = 0; i < o->c1_len; i++) o->c1[i] = (uint8_t)strtoul([[c1 substringWithRange:NSMakeRange(2 * i, 2)] UTF8String], NULL, 16); }

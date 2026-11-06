@@ -48,5 +48,7 @@ for all three variants. That workaround is not committed. No complete iOS app or
 ## Limits
 
 A previous game run stopped before AV1 initialization; these are concrete platform defects, but that observation
-alone does not establish their responsibility for the black screen. A new bounded game trial is needed. The separate
+alone does not establish their responsibility for the black screen. The next bounded trial reached first present at 3.398 s, AV1 decode and audio, but the user still saw pink video
+near 20 FPS. It then stopped at an unsupported c0+0x640 shader-driver word. One successful startup does not
+establish that the event changes alone cured the intermittent startup stall. The separate
 image-write fix addresses a different verified missing output operation. Installed TOTK is untouched.
