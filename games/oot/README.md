@@ -16,6 +16,10 @@ TOTK_GPU_ALLOW_SUBMIT=1 TOTK_GPU_BLOCKRT=1 TOTK_GPU_MIDCLEAR=1 TOTK_GPU_WIDEN=1 
 
 Use the matching rebuilt NativeAOT translator and shader chain `totk-native-v16-ns2-mesh-layout`. Old shader libraries cannot be reused unchanged after this chain update. There is no packaged OoT .app/iOS build flow yet.
 
+For development runs, keep `TOTK_SHADER_CACHE` on a persistent OoT directory for this translator chain and keep `DM_PSO_USER` on a persistent TSV. The runtime stores translated variants and Metal pipeline archives in the cache, and pipeline descriptors in the TSV. Set `TOTK_SHADER_CONTRIB` to a separate local OoT file to record shareable identifiers as you play.
+
+To collect past sessions, run `games/totk/scripts/shader_list.py merge <list> <cache-dir> <pso-user.tsv>` with a copy of the list under an `oot/assets` directory. Pass the cache before its TSV so recorded pipeline names resolve to their portable bind states. Run `stats` on the result. Share only the list as described in [the contribution guide](../../docs/shader-list.md). Preparing a seed from another player's list still depends on finding the recorded shader keys in the local dump. The development corpus and seed tools do not cover all OoT shader archive formats or task/mesh stages yet.
+
 The complete reconstruction network runs by default. Lossy `TOTK_NDSR_BYPASS=1` and the separate direct-movie experiment are diagnostic opt-ins. `TOTK_BARRIER_GAME=1` enables the newly imported barrier-order optimization; it remains off while this integration is being validated. `DM_FRAME_DELTA=0` selects the original fixed game step for comparison. No image-quality trade-off is required by the default path.
 
 Memory remains a limitation on 16/18 GB machines. Only addressable pools enter the raw pool table; resource lifetimes and the system wired-memory guard are retained. The texture table has finite capacity and does not yet handle every image/buffer-texture handle read from memory. Full-game appearance, long-session stability and iOS device operation still require testing.
