@@ -52,7 +52,56 @@ int mtl_probe_oot_movie(void) {
         mtl_sub_commit();mtl_finish();const uint8_t *b=rb.contents;
         if(b[0]!=255||b[1]!=0||b[2]!=255||b[3]!=255)MDIE("movie fallback dispatch lost");checked+=4;
         mtl_sub_begin();mtl_exec((const uint8_t *)&end);S.cprog=&program;S.img[5][0]=1;S.img[5][1]=2;
-        oot_movie_remember(convert);dispatch(&dp);
+        oot_movie_remember(convert);
+        if (!mode) {
+            dispatch(&dp);
+        } else {
+            enum { N = sizeof oot_movie_network / sizeof *oot_movie_network };
+            uint8_t control[0x880] = {[0x714] = 5};
+            prog_t programs[N - 1] = {0};
+            struct { op_hdr bind; p_bind_program program; op_hdr run; p_dispatch dispatch; } ops[N];
+            struct { uint8_t bytes[sizeof ops]; op_hdr end; } packet;
+            packet.end = end;
+            program.nstage = 1;
+            program.sd[0].control = control;
+            program.sd[0].data = (uintptr_t)control;
+            for (unsigned i = 0; i < N; ++i) {
+                prog_t *p = &program;
+                if (i != N - 1) {
+                    p = &programs[i];
+                    *p = program;
+                    p->serial = 0xfffffb00 + i;
+                    NvShader *shader = [NvShader new];
+                    snprintf(shader->key, sizeof shader->key, "%s-probe_b", oot_movie_network[i]);
+                    NvProg *resolved = [NvProg new];
+                    resolved->sh[5] = shader;
+                    serial_put(p->serial, resolved);
+                }
+                ops[i].bind = (op_hdr){OP_BIND_PROGRAM, sizeof(op_hdr) + sizeof(p_bind_program)};
+                ops[i].program = (p_bind_program){p, NVN_SHADER_STAGE_COMPUTE_BIT};
+                ops[i].run = (op_hdr){OP_DISPATCH, sizeof(op_hdr) + sizeof(p_dispatch)};
+                ops[i].dispatch = dp;
+            }
+            ops[1].dispatch.ind = 1;
+            memcpy(packet.bytes, ops, sizeof ops);
+            if (oot_movie_try_network(packet.bytes)) MDIE("movie accepted indirect reconstruction");
+            ops[1].dispatch.ind = 0;
+            ops[1].bind.op = OP_FENCE_SYNC;
+            memcpy(packet.bytes, ops, sizeof ops);
+            if (oot_movie_try_network(packet.bytes)) MDIE("movie accepted a side-effect command");
+            ops[1].bind.op = OP_BIND_PROGRAM;
+            memcpy(packet.bytes, ops, sizeof ops);
+            S.img[5][1] = 0;
+            if (oot_movie_try_network(packet.bytes)) MDIE("movie accepted a missing sequence output");
+            S.img[5][1] = 2;
+            g_oot_movie_skip_end = oot_movie_try_network(packet.bytes);
+            if (g_oot_movie_skip_end != packet.bytes + (N - 1) * sizeof ops[0] + sizeof(op_hdr) + sizeof(p_bind_program))
+                MDIE("movie sequence was not fully recognized");
+            mtl_exec(packet.bytes);
+            if (g_oot_movie_skip_end) MDIE("movie sequence skip state leaked");
+            checked += 5;
+            for (unsigned i = 0; i < N - 1; ++i) mtl_prog_release(&programs[i]);
+        }
         if(g_oot_movie_decoded||!gpu_owned(t[1].serial)||S.cprog!=&program||S.img[5][1]!=2)MDIE("movie state/ownership");checked+=4;
         registry_lock();out=tex_by_id(2);registry_unlock();
         for(int i=0;i<5;i++)enc_b_copy_texture_buffer(blit(),out,0,0,MTLOriginMake(xy[i][0],xy[i][1],0),MTLSizeMake(1,1,1),rb,i*256,256,256);

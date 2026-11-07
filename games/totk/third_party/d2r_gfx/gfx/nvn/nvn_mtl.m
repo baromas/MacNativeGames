@@ -1312,10 +1312,12 @@ void mtl_eye_done(int left, int last) {   // after an eye pass's commit (hle_nvn
 void mtl_eye_capture(int eye) { g_b2_capture = eye; }
 static id<MTLTexture> g_oot_movie_decoded;
 static uint64_t g_oot_movie_sub;
+static const uint8_t *g_oot_movie_skip_end;
 static int g_last_end_relaxed, g_game_barrier; static uint64_t g_bar_skip, g_bar_full;
 void mtl_sub_begin(void) {
     g_last_end_relaxed = 0;
     g_oot_movie_decoded = nil;
+    g_oot_movie_skip_end = NULL;
     g_eye_region = 3;   // stereo B2: a submission starts outside eye marks
     g_fc_begin0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     /* The submission's autorelease pool, drained in mtl_sub_commit, opens before anything else: the guest's submit
@@ -15448,7 +15450,7 @@ static id<MTL4ComputeCommandEncoder> disp_enc(void) {
     return g_blit;
 }
 #include "oot_movie_direct.inc"
-static void dispatch(const p_dispatch *dp) {
+static void dispatch_at(const p_dispatch *dp, const uint8_t *next) {
 #ifdef GAME_NS2
     /* nvnCommandBufferDispatchComputeIndirect: {x, y, z}. The GPU usually writes them earlier in the frame, and Metal reads them when the
        dispatch runs, so the CPU does not wait for them (seedds/nxnative, MIT). Waiting took 74% of the replay in Kokiri Forest, 7 fps.
@@ -15458,7 +15460,7 @@ static void dispatch(const p_dispatch *dp) {
     if (dp->ind && readback) {
         uint32_t r[3] = {0, 0, 0}; indirect_read(dp->ind, r, sizeof r);
         if (!r[0] || !r[1] || !r[2] || r[0] > INT32_MAX || r[1] > INT32_MAX || r[2] > INT32_MAX) return;
-        p_dispatch direct = {(int32_t)r[0], (int32_t)r[1], (int32_t)r[2], dp->caller, 0}; dispatch(&direct); return; }
+        p_dispatch direct = {(int32_t)r[0], (int32_t)r[1], (int32_t)r[2], dp->caller, 0}; dispatch_at(&direct, NULL); return; }
     if (dp->ind && !mtl_gpu_addr(dp->ind, 12, &ind_buf, &ind_off, &ind_gpu)) { RED_ONCE(163, "indirect dispatch skipped: its arguments at %#llx are in no memory pool", (unsigned long long)dp->ind); return; }
     if (dp->ind) { static int once; if (!once++) MLOG("indirect dispatch: first time (the GPU reads the counts at %#llx)", (unsigned long long)dp->ind); }
     if (!dp->ind)
@@ -15477,7 +15479,7 @@ static void dispatch(const p_dispatch *dp) {
     if (cpr->missing) { static uint64_t n; if (!n++) MLOG("[shader-miss] 计算着色器还没翻译：跳过这个派发（以后同类不再提示）"); return; }
     NvShader *cs = cpr->sh[5];
     if (!cs) { RED_ONCE(28, "派发的程序没有计算着色器（或未映射）"); return; }
-    int movie = oot_movie_enabled() && dp->x > 0 && dp->y > 0 && dp->z == 1 ? oot_movie_role(cs->key) : 0;
+    int movie = oot_movie_enabled() && !dp->ind && dp->x > 0 && dp->y > 0 && dp->z == 1 ? oot_movie_role(cs->key) : 0;
     if (movie == 1) g_oot_movie_decoded = nil;
     if (movie == 2 && oot_movie_replace(cs)) return;
     /* TOTK_SKIP_CS=all | <key prefix>[,<key prefix>...] (diagnostic): those compute dispatches are not run (bisecting a
@@ -15584,7 +15586,10 @@ static void dispatch(const p_dispatch *dp) {
 #endif
     enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2]));
     if (!reuse) enc_c_end(ce);
-    if (movie == 1) oot_movie_remember(cs);
+    if (movie == 1) {
+        oot_movie_remember(cs);
+        g_oot_movie_skip_end = oot_movie_try_network(next);
+    }
     bright_lut(cs);   // 3D 画面加亮：游戏算完调色表之后重写 | 3D picture brightening: rewrite after the game finishes computing the color lookup table
     /* TOTK_EXPO_LOG=<file> (diagnostic): after each dispatch of the exposure kernel (ae725063), copy floats 96..127 of its
        storage buffer 0 (statistics; exposure at 108..111) into a shared ring and write them with the frame number once
@@ -15602,6 +15607,7 @@ static void dispatch(const p_dispatch *dp) {
 }
 // GPU：贴图 → 缓冲（行距取 SetCopyRowStride，0 = 紧排）
 // GPU: texture -> buffer (row stride taken from SetCopyRowStride, 0 = tightly packed)
+static void dispatch(const p_dispatch *dp) { dispatch_at(dp, NULL); }
 static void copy_t2b(const p_copy_b2t *c) {
     { static long on = -1; static int left = 24; if (on < 0) { const char *e = getenv("TOTK_T2T_LOG"); on = e ? atol(e) : 0; if (e && !on) on = 1; }   // with TOTK_T2T_LOG: buffer <-> texture copies too
       if (on > 0 && (long)atomic_load(&g_cur_frame) >= on && left > 0 && c->tex) { left--;
@@ -16322,7 +16328,13 @@ void mtl_exec(const uint8_t *p) {
             case OP_COPY_T2B: copy_t2b(a); break;
             case OP_COPY_T2T: copy_t2t(a); break;
             case OP_CLEAR_TEX: clear_tex(a); break;
-            case OP_DISPATCH: dispatch(a); break;
+            case OP_DISPATCH:
+                if (g_oot_movie_skip_end) {
+                    if (p == g_oot_movie_skip_end) g_oot_movie_skip_end = NULL;
+                } else {
+                    dispatch_at(a, p + h.size);
+                }
+                break;
 #ifdef GAME_NS2
             case OP_MESH_TASKS: mesh_tasks_draw(a); break;
 #endif
