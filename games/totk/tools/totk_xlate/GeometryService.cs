@@ -69,7 +69,7 @@ static partial class ShaderService
             ["key"] = variant + "_b", ["route"] = "B", ["chain"] = chain, ["stage"] = "gs",
             ["entry"] = entry.Groups[2].Value, ["msl_entry_kind"] = "kernel",
             ["threadgroup_size"] = localSize, ["c1"] = GetStr(rq, "c1", ""), ["notes"] = res["notes"].DeepClone(),
-            ["drv_reads"] = dr, ["drv_unfillable"] = Unfillable(dr, "gs"), ["bindings"] = Reflect("gs", src, res),
+            ["drv_reads"] = dr, ["drv_unfillable"] = Unfillable(dr, "gs", GetStr(rq, "arch", "") == "sm86"), ["bindings"] = Reflect("gs", src, res),
             ["vertex_inputs"] = new JsonArray(), ["raster"] = new JsonObject(), ["deps"] = TextureDeps(src, res, tex, img, depthSlots),
             ["softfloat64"] = softfloat64, ["compare_slots"] = new JsonArray(compareSlots.Select(s => (JsonNode)s).ToArray()),
             ["geometry"] = layout,

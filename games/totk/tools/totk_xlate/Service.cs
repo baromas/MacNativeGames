@@ -41,7 +41,7 @@ static partial class ShaderService
     // stage, compute thread-group counts (0x200) and uniform-buffer table (0x210), vertex point-size limit (0x610); c2 handles.
     static readonly Dictionary<string, (long lo, long hi)[]> DrvFillC0 = new()
     {
-        ["vs"] = new[] { (0x110L, 0x210L), (0x610L, 0x620L) }, ["ps"] = new[] { (0x510L, 0x610L) }, ["cs"] = new[] { (0L, 0x10L), (0x200L, 0x410L) },
+        ["vs"] = new[] { (0x110L, 0x210L), (0x610L, 0x620L) }, ["ps"] = new[] { (0x510L, 0x610L) }, ["cs"] = new[] { (0x200L, 0x410L) },
         ["ts"] = new[] { (0x670L, 0x770L) }, ["ms"] = new[] { (0x770L, 0x870L) },
         ["gs"] = new[] { (GsSsboBase, GsSsboBase + 0x100) },   // the geometry stage's storage buffer table
     };
@@ -367,7 +367,7 @@ static partial class ShaderService
         return dr;
     }
 
-    static JsonArray Unfillable(JsonObject dr, string stage)
+    static JsonArray Unfillable(JsonObject dr, string stage, bool nvn2)
     {
         var bad = new JsonArray();
         foreach (var kv in dr)
@@ -379,7 +379,7 @@ static partial class ShaderService
             foreach (JsonNode o in d["vec4_offsets"].AsArray())
             {
                 long ov = Long(o);
-                if (!ranges.Any(r => r.lo <= ov && ov < r.hi)) bad.Add((JsonNode)$"c{kv.Key}+0x{ov.ToString("x", CultureInfo.InvariantCulture)}");
+                if (!(nvn2 && stage == "cs" && bank == 0 && ov == 0) && !ranges.Any(r => r.lo <= ov && ov < r.hi)) bad.Add((JsonNode)$"c{kv.Key}+0x{ov.ToString("x", CultureInfo.InvariantCulture)}");
             }
         }
         return bad;
@@ -524,7 +524,7 @@ static partial class ShaderService
         JsonObject captureInfo = capture ? AppendCapture(rq, job, variant, src, msl) : null;
         Match entry = Regex.Match(src, @"(vertex|fragment|kernel)\s+\S+\s+(\w+)\s*\(");
         JsonObject dr = DrvReads(src, stage);
-        JsonArray unfillable = Unfillable(dr, stage);
+        JsonArray unfillable = Unfillable(dr, stage, GetStr(rq, "arch", "") == "sm86");
         var vertexInputs = new JsonArray(Regex.Matches(src, @"(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]")
             .Select(m => (JsonNode)new JsonObject { ["location"] = ParseInt(m.Groups[2].Value), ["msl_type"] = m.Groups[1].Value }).ToArray());
         Match outStruct = Regex.Match(src, @"struct main0_out\s*\{(.*?)\};", RegexOptions.Singleline);

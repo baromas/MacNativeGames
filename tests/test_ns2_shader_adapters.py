@@ -40,6 +40,12 @@ class Ns2ShaderAdapters(unittest.TestCase):
         self.assertIn('[[base_instance]]',lowered);self.assertNotIn('_m0[100].y',lowered)
         self.compile_metal(lowered)
         self.assertEqual(self.run_adapter('base',lowered),lowered)
+        existing=original.replace('[[buffer(0)]])','[[buffer(0)]], uint gl_BaseInstance [[base_instance]])')
+        lowered_existing=self.run_adapter('base',existing)
+        self.assertIn('as_type<float>(int(gl_BaseInstance))',lowered_existing)
+        self.assertEqual(lowered_existing.count('[[base_instance]]'),1)
+        self.assertNotIn('_m0[100].y',lowered_existing)
+        self.compile_metal(lowered_existing)
         for bad in (original.replace('[100].y','[100].x'),original.replace('vertex ','fragment '),original.replace('return float4','return float4((*spvDescriptorSet0.vp_c0)._m0[100].x) + float4')):
             self.assertEqual(self.run_adapter('base',bad),bad)
     def test_pool_tables_renumber_ids_and_preserve_small_arrays(self):
@@ -100,3 +106,27 @@ class Ns2ShaderAdapters(unittest.TestCase):
             self.assertEqual(reflection['mesh_stage']['kind'],kind)
             self.assertEqual(reflection['drv_unfillable'],[])
             self.compile_metal((self.work/(rq['variant']+'_b.metal')).read_text())
+
+    def test_ampere_global_address_and_atomic_forms(self):
+        # Adapted from nxnative's constructed SM86 fixtures, MIT. A memory
+        # descriptor must not enter the address. INC and CAS must still write.
+        xlate=Path(os.environ.get('MNG_TEST_XLATE',ROOT/'games/totk/prebuilt/macos-arm64/totk_xlate'))
+        def lower(*operations):
+            init=[(0x000e260000002100,0x7919|(r<<16)) for r in (9,19,20,21,22)]
+            store=(0x000fe8000000c800,0x0000080609008388)
+            body=[(hi|(0x3f<<52),lo) for hi,lo in (*operations,store)]
+            code=self.work/'atomics.code'
+            code.write_bytes(b''.join(struct.pack('<QQ',lo,hi) for hi,lo in (*init,*body,(0x000fea0003800000,0x794d))))
+            rq=dict(variant='atomics',stage='cs',arch='sm86',code=str(code),tex={},img={},attr={},fout={},local=[32,1,1],debug=True,shared=4096,nvn2_cs=[0,0,3,0x40,0])
+            p=subprocess.run([str(xlate),'--service','--spirv-cross','(linked in)','--out',str(self.work),'--chain','synthetic-atomic-test'],input=json.dumps(rq)+'\n',capture_output=True,text=True,timeout=30)
+            self.assertEqual(p.returncode,0,p.stderr);self.assertTrue(json.loads(p.stdout)['ok'],p.stdout+p.stderr)
+            return (self.work/'atomics_b.metal').read_text()
+        set_descriptor=(0x000fe200000e0000,0x00000000130473c2)
+        self.assertEqual(lower(set_descriptor,(0x000fe2200c1e1900,0x0000000414067981)),
+                         lower(set_descriptor,(0x000fe2200c1e1900,0x0000003f14067981)))
+        for op in ((0x000fe200001ee116,0x00000013140673a9),
+                   (0x000fe200019ee100,0x00000013140673a8),
+                   (0x000fe20001800000,0x000000141306738c)):
+            shader=lower(op)
+            self.assertIn('atomic_compare_exchange',shader)
+            self.compile_metal(shader)

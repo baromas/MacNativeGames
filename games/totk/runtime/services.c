@@ -100,7 +100,11 @@ static uint8_t user_exception_context[0x1000] __attribute__((aligned(0x1000)));
    profile: 10, which is taken; neither measured on the console): with a
    Switch 1 pool (3.2 GiB) Bananza's heaps did not fit (AudioSystemHeap creation returned null). Address space only until
    the game maps it. */
+#ifdef GAME_OOT
+#define APP_POOL_DEFAULT 0x240000000ULL   /* 9 GiB, as nxnative's profile: a map past it fails and the SDK gives back the pages it keeps (crashes entering later areas without it, reported there; not reached here) */
+#else
 #define APP_POOL_DEFAULT 0x280000000ULL
+#endif
 #else
 #define APP_POOL_DEFAULT (dram_8gb()?0x1b3400000ULL:0xcd500000ULL)
 #endif
@@ -374,7 +378,14 @@ static uint32_t observed_region(uint64_t *out,uint64_t size){
 }
 static uint32_t observed_pages(uint64_t addr,uint64_t size){uint32_t r=((uint32_t(*)(uint64_t,uint64_t))runtime_symbol("_ZN2nn2os19AllocateMemoryPagesEmm"))(addr,size);if(r||trace_alloc())fprintf(stderr,"[totk] AllocateMemoryPages address=%llx size=%llx result=%x\n",(unsigned long long)addr,(unsigned long long)size,r);return r;}
 /* TEMP probe (OoT boot): what the Switch 2 VAMM trio answers for the game's heap setup. */
-static uint32_t observed_query_mem_info(void *out){uint32_t r=((uint32_t(*)(void*))runtime_symbol("_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE"))(out);uint64_t *m=out;fprintf(stderr,"[totk-probe] QueryMemoryInfo out=%llx -> m0=%llx m1=%llx m2=%llx m3=%llx result=%x\n",(unsigned long long)(uintptr_t)out,(unsigned long long)m[0],(unsigned long long)m[1],(unsigned long long)m[2],(unsigned long long)m[3],r);return r;}
+static uint32_t observed_query_mem_info(void *out){
+ uint32_t r=((uint32_t(*)(void*))runtime_symbol("_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE"))(out);
+ if(r||!out){fprintf(stderr,"[totk-probe] QueryMemoryInfo result=%x\n",r);return r;}
+ const uint64_t *m=out;
+ fprintf(stderr,"[totk-probe] QueryMemoryInfo m0=%llx m1=%llx m2=%llx m3=%llx result=%x\n",
+         (unsigned long long)m[0],(unsigned long long)m[1],(unsigned long long)m[2],(unsigned long long)m[3],r);
+ return r;
+}
 static uint32_t observed_set_heap_size(uint64_t size){uint32_t r=((uint32_t(*)(uint64_t))runtime_symbol("_ZN2nn2os17SetMemoryHeapSizeEm"))(size);fprintf(stderr,"[totk-probe] SetMemoryHeapSize %llx result=%x\n",(unsigned long long)size,r);return r;}
 static uint32_t observed_alloc_block(void *out,uint64_t size){uint32_t r=((uint32_t(*)(void*,uint64_t))runtime_symbol("_ZN2nn2os19AllocateMemoryBlockEPmm"))(out,size);fprintf(stderr,"[totk-probe] AllocateMemoryBlock out=%llx size=%llx -> block=%llx result=%x\n",(unsigned long long)(uintptr_t)out,(unsigned long long)size,out?*(unsigned long long *)out:0u,r);return r;}
 static void *observed_std_init(void *self,void *heap,uint64_t size,unsigned boolarg){fprintf(stderr,"[totk-probe] StandardAllocator::Initialize self=%llx heap=%llx size=%llx bool=%u\n",(unsigned long long)(uintptr_t)self,(unsigned long long)(uintptr_t)heap,(unsigned long long)size,boolarg);uint32_t r=((uint32_t(*)(void*,void*,uint64_t,unsigned))runtime_symbol("_ZN2nn3mem17StandardAllocator10InitializeEPvmb"))(self,heap,size,boolarg);unsigned char*p=self;fprintf(stderr,"[totk-probe]   -> result=%x self[0..0x40]: %02x %02x %02x | hdr %llx %llx | flags %x\n",r,p[0],p[1],p[2],((uint64_t*)self)[2],((uint64_t*)self)[3],((uint32_t*)((char*)self+0xc))[0]);if(heap)fprintf(stderr,"[totk-probe]   block[0..0x40]: %llx %llx %llx %llx | mutex@38: %02x %02x %02x %02x %02x %02x %02x %02x | hdr30 %llx\n",((uint64_t*)heap)[0],((uint64_t*)heap)[1],((uint64_t*)heap)[2],((uint64_t*)heap)[3],((unsigned char*)heap)[0x38],((unsigned char*)heap)[0x39],((unsigned char*)heap)[0x3a],((unsigned char*)heap)[0x3b],((unsigned char*)heap)[0x3c],((unsigned char*)heap)[0x3d],((unsigned char*)heap)[0x3e],((unsigned char*)heap)[0x3f],((uint64_t*)((char*)heap+0x30))[0]);return NULL;}
@@ -402,7 +413,11 @@ static void observed_light_clear(void *ev){lv_log("C ",ev);
 void *runtime_observer(const char *name) {
  static const struct {const char *name;void *fn;} entries[]={
  {"_ZN2nn2os21AllocateAddressRegionEPmm",observed_region},{"_ZN2nn2os19AllocateMemoryPagesEmm",observed_pages},{"_ZN2nn2os15QueryMemoryInfoEPNS0_10MemoryInfoE",observed_query_mem_info},{"_ZN2nn2os17SetMemoryHeapSizeEm",observed_set_heap_size},{"_ZN2nn2os19AllocateMemoryBlockEPmm",observed_alloc_block},{"_ZN2nn3mem17StandardAllocator8AllocateEmm",observed_std_alloc},{"_ZN2nn3mem17StandardAllocator10InitializeEPvmb",observed_std_init},{"nnosInitialize",observed_os_init},{"nninitInitializeSdkModule",observed_sdk_init},{"nninitStartup",observed_startup},{"nnMain",observed_main},{"nndiagAbort",observed_abort},{"_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE",observed_light_wait},{"_ZN2nn2os19TimedWaitLightEventEPNS0_14LightEventTypeENS_8TimeSpanE",observed_light_timedwait},{"_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE",observed_light_signal},{"_ZN2nn2os15ClearLightEventEPNS0_14LightEventTypeE",observed_light_clear}};
- for(size_t i=0;i<sizeof(entries)/sizeof(entries[0]);i++)if(!strcmp(name,entries[i].name))return entries[i].fn;return NULL;
+ for(size_t i=0;i<sizeof(entries)/sizeof(entries[0]);i++)if(!strcmp(name,entries[i].name)){
+  if(entries[i].fn==observed_query_mem_info&&!trace_alloc())return NULL;
+  return entries[i].fn;
+ }
+ return NULL;
 }
 void *runtime_override(const char *name) {
  static const struct {const char *name;void *fn;} entries[]={

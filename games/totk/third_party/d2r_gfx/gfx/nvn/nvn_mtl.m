@@ -2251,7 +2251,13 @@ void mtl_counter_stats(uint64_t rep[32], uint64_t rst[32]) { memcpy(rep, g_cnt_r
    (main+0x8f6bec). CLOCK_MONOTONIC counts sleep while mach_absolute_time does not: the reported GPU end was later than the
    frame start by the machine's whole sleep time since boot (24 days on the Mac, 20 on the iPhone), so the game sat at
    interval 3 (20 frames) everywhere once the device had slept. */
-static uint64_t gpu_ticks(void) { static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb); __uint128_t ns = (__uint128_t)mach_absolute_time() * tb.numer / tb.denom; return (uint64_t)(ns * 12 / 625); }
+/* NVN counter timestamps are 614.4 MHz ticks (384 per 625 ns; seedds/nxnative nvn_timestamp.h, MIT): a game that converts them itself reads a span 32 times too short in 19.2 MHz ticks. Ocarina of Time only for now; totk_nvn_ext.c holds the inverse. */
+#ifdef GAME_OOT
+#define GPU_TICKS_NUM 384
+#else
+#define GPU_TICKS_NUM 12
+#endif
+static uint64_t gpu_ticks(void) { static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb); __uint128_t ns = (__uint128_t)mach_absolute_time() * tb.numer / tb.denom; return (uint64_t)(ns * GPU_TICKS_NUM / 625); }
 
 // ---------- 启动埋点（DM_BOOTPROF=1）：metallib 载入、管线创建（均在提交线程回放中同步发生）、贴图上传、首帧出图 ----------
 // ---------- Boot instrumentation (DM_BOOTPROF=1): metallib loading, pipeline creation (both happen synchronously during replay on the submit thread), texture upload, first-frame present ----------
@@ -6612,10 +6618,11 @@ static void treg_link_locked(int tid) {
     if (head) g_treg[head - 1].view_prev = tid + 1;
     nvn_hm_put(&g_view_heads, &serial, (void *)(uintptr_t)(tid + 1));
 }
+static void type_view_drop_locked(id base);
 static void treg_clear_view_locked(int tid) {
     treg_t *r = &g_treg[tid];
     treg_unlink_locked(tid);
-    if (r->view) { defer_obj_unref((__bridge id)r->view); CFRelease(r->view); r->view = NULL; }
+    if (r->view) { type_view_drop_locked((__bridge id)r->view); defer_obj_unref((__bridge id)r->view); CFRelease(r->view); r->view = NULL; }
     r->view_id = r->view_rid = r->view_ser = r->view_dirty = 0; r->view_pkg = r->dead_pending = 0; r->view_tt = 0; r->view_parent = NULL;
 }
 // 贴图号 → 序号的无锁副本（回放热路径只要序号：写回前瞻索引、纯清除前提的绑定集合）：贴图号 20 位，固定 1M 项（BSS，只占碰过的页），
@@ -9953,20 +9960,38 @@ static NSMapTable<id, id<MTLTexture>> *g_type_views;
 /* Cached views retain their parent allocation. Evict after that allocation has been removed from
    residency by the completed-fence retirement path; a strong cache must not keep every upload alive.
    Caller cadence is bounded, and deferral also protects views used by the most recent submission. */
+/* The whole map used to be walked at once every 64 submissions, under both locks: about 10 frames apart in Ocarina of Time, one frame in ten took 30-60 ms more, growing with the map.
+   Now a list of the keys is taken once and a slice of it is checked at each submission, so the map is covered about every 256 submissions, a key leaving the list as it is checked. TOTK_TYPE_VIEW_SWEEP=all restores the old walk. */
+static NSMutableArray *g_tv_todo; static unsigned g_tv_slice;
+static void type_views_sweep_one(id key) {   // caller holds both locks
+    id<MTLTexture> view = [g_type_views objectForKey:key], base = view;
+    if (!view) return;   // gone since the list was taken
+    while (base.parentTexture) base = base.parentTexture;
+    id<MTLResource> allocation = base.buffer ?: (id<MTLResource>)base;
+    if ([g_res_objects containsObject:allocation]) return;
+    defer_obj_unref(view); defer_obj_unref(key);
+    [g_type_views removeObjectForKey:key]; g_type_retired_views++;
+}
 static void type_views_sweep_retired(void) {
-    if (g_sub_serial & 63) return;
+    static int all = -1; if (all < 0) { const char *e = getenv("TOTK_TYPE_VIEW_SWEEP"); all = e && !strcmp(e, "all"); }
+    if (all && (g_sub_serial & 63)) return;
     registry_lock();
+    if (!all && !g_type_views.count) { registry_unlock(); return; }
     pthread_mutex_lock(&g_res_mu);
-    for (id key in g_type_views.keyEnumerator.allObjects) {
-        id<MTLTexture> view = [g_type_views objectForKey:key], base = view;
-        while (base.parentTexture) base = base.parentTexture;
-        id<MTLResource> allocation = base.buffer ?: (id<MTLResource>)base;
-        if ([g_res_objects containsObject:allocation]) continue;
-        defer_obj_unref(view); defer_obj_unref(key);
-        [g_type_views removeObjectForKey:key]; g_type_retired_views++;
+    if (all) { for (id key in g_type_views.keyEnumerator.allObjects) type_views_sweep_one(key); }
+    else {
+        if (!g_tv_todo.count) { g_tv_todo = [g_type_views.keyEnumerator.allObjects mutableCopy]; g_tv_slice = (unsigned)g_tv_todo.count / 256 + 1; }
+        for (unsigned n = g_tv_slice; n && g_tv_todo.count; n--) { id key = g_tv_todo.lastObject; [g_tv_todo removeLastObject]; type_views_sweep_one(key); }
     }
     pthread_mutex_unlock(&g_res_mu);
     registry_unlock();
+}
+/* An ID's view is going: so does its cached view as another type, which otherwise kept it and its parent for good, 88 new entries a frame in Ocarina of Time. A real texture (no parent) may serve other IDs, and stays. TOTK_TYPE_VIEW_DROP=0 keeps them. */
+static void type_view_drop_locked(id base) {
+    static int on = -1; if (on < 0) { const char *e = getenv("TOTK_TYPE_VIEW_DROP"); on = !(e && !atoi(e)); }
+    if (!on || !g_type_views || !((id<MTLTexture>)base).parentTexture) return;
+    id<MTLTexture> v = [g_type_views objectForKey:base]; if (!v) return;
+    defer_obj_unref(v); defer_obj_unref(base); [g_type_views removeObjectForKey:base];
 }
 static id<MTLTexture> tex_type_view(id<MTLTexture> base, MTLTextureType want) {
     if (!g_type_views) g_type_views = [NSMapTable mapTableWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality valueOptions:NSPointerFunctionsStrongMemory];
@@ -10047,10 +10072,10 @@ static uint64_t gmem_map_gpu(void) {
 #ifdef GAME_OOT
         if (pool_addr_only() && !addr_meets(p->lo, p->hi)) continue;
 #endif
-        pool_res(p);
         uint64_t lo = MAX((uint64_t)p->lo, end), hi = p->hi;
         if (lo >= hi) continue;
         if (n == GMEM_MAP_ENTRIES) { over++; continue; }
+        pool_res(p);
         uint64_t e[3] = {lo, hi, p->gpu - (uint64_t)p->base}; memcpy(t + (size_t)n++ * GMEM_MAP_ENTRY, e, sizeof e); end = hi;
     }
     pthread_mutex_unlock(&g_mu);
@@ -19224,6 +19249,9 @@ int mtl_probe_drv_c0(void) {
         "kernel void main0(constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]], uint3 gl_WorkGroupID [[threadgroup_position_in_grid]], uint3 gl_LocalInvocationID [[thread_position_in_threadgroup]])\n"
         "{\n    if (gl_LocalInvocationID.x != 0u || gl_LocalInvocationID.y != 0u) return;\n"
         "    uint nx = as_type<uint>((*spvDescriptorSet0.cp_c0)._m0[32].x), ny = as_type<uint>((*spvDescriptorSet0.cp_c0)._m0[32].y), nz = as_type<uint>((*spvDescriptorSet0.cp_c0)._m0[32].z);\n"
+#ifdef GAME_NS2
+        "    if (any(as_type<uint4>((*spvDescriptorSet0.cp_c0)._m0[0]).yzw != uint3(nx,ny,nz))) return;\n"
+#endif
         "    uint t = gl_WorkGroupID.y * nx + gl_WorkGroupID.x;\n"
         "    (*spvDescriptorSet0.cp_s0)._m0[t * 4u] = nx; (*spvDescriptorSet0.cp_s0)._m0[t * 4u + 1u] = ny;\n"
         "    (*spvDescriptorSet0.cp_s0)._m0[t * 4u + 2u] = nz; (*spvDescriptorSet0.cp_s0)._m0[t * 4u + 3u] = 0xc0ffee00u + t;\n}\n";
@@ -19286,6 +19314,33 @@ int mtl_probe_drv_c0(void) {
             MDIE("drv-cache probe: changed dispatch cell %u = {%u,%u,%u,%#x}, expected {3,2,1,%#x}", t,c[0],c[1],c[2],c[3],0xc0ffee00u+t);
         checked += 4;
     }
+#ifdef GAME_NS2
+    /* The counts are made by the GPU in this submission. The indirect launch and
+       both c0 aliases must see the new values, including after a second fill. */
+    memset(mem, 0, PG);
+    mtl_sub_begin(); mtl_exec((const uint8_t *)&end);
+    S.prog = &p;
+    uint64_t counts = (uint64_t)(uintptr_t)(mem + 2048);
+    for (uint32_t x = 2; x <= 3; x++) {
+        uint32_t *output = mem + (x - 2) * 1024;
+        S.ssbo[5][0] = (p_bind_buf){5, 0, (uint64_t)(uintptr_t)output, 4096};
+        mtl_sub_fill(counts, 4, x);
+        mtl_sub_fill(counts + 4, 4, 2);
+        mtl_sub_fill(counts + 8, 4, 1);
+        p_dispatch indirect = {.ind = counts};
+        dispatch(&indirect);
+    }
+    S.prog = saved; mtl_sub_commit(); mtl_finish(); memset(&S.ssbo, 0, sizeof S.ssbo);
+    for (uint32_t x = 2; x <= 3; x++) {
+        const uint32_t *output = mem + (x - 2) * 1024;
+        for (uint32_t cell = 0; cell < x * 2; cell++) {
+            const uint32_t *v = output + cell * 4;
+            if (v[0] != x || v[1] != 2 || v[2] != 1 || v[3] != 0xc0ffee00u + cell)
+                MDIE("NVN2 indirect grid probe: %ux2 cell %u read {%u,%u,%u,%#x}", x, cell, v[0], v[1], v[2], v[3]);
+            checked += 4;
+        }
+    }
+#endif
     /* The production cache builder's other dependencies: vertex SSBO size/address,
        point-size limit, c2 combined handles, separate samplers, compute uniform table. */
     mtl_sub_begin(); mtl_exec((const uint8_t *)&end);

@@ -29,3 +29,15 @@ The first batch passed 1,489 tests (164 skipped) and the focused Metal probes. O
 OoT iOS packaging is not supported by this tree's IPA builder. The Mac and iOS NativeAOT translators are rebuilt together; host/graphics source compilation is checked separately and must not be described as an iOS device run.
 
 Still to investigate after the combined build: full 3D rendering and material correctness, subtitle/audio timing in play, long-session memory pressure, packed-image families and dynamically fetched image/buffer-texture handles. Optional async AV1 decoding, broad raw-memory range optimizations and prewarm manifests are not prerequisites silently assumed present here. A renderer build passing is not evidence that these are complete.
+
+## Shader and host follow-up
+
+The v14 shader chain fixes the crash from the first batch. A vertex shader can already have a `[[base_instance]]` argument when it still explicitly reads NVN c0+0x644. The adapter now reuses that argument. The previously failing variant was translated offline and compiled to Metal AIR with no remaining unfillable driver words. The constructed regression exercises both forms of the argument list.
+
+The Ampere ALU and memory emitters were compared with nxnative at `6d5ed718`. The follow-up incorporates the new ALU behavior, shared and global atomics, descriptor-address handling and directed rounding. Raw global memory reuses the last matching pool for successive accesses within an invocation. Only pools included in the actual table become resident. An indirect GPU probe writes two sets of counts on the GPU and checks both NVN2 driver aliases, the grid size and the result across the two launches. It also passes with explicit CPU readback as a reference.
+
+The selected `e8ee7448` host changes limit OoT to 60 FPS using the host clock, correct the NVN timestamp unit, and release alternate type views with their owning descriptor. The pool remains scoped to 9 GiB of guest address space. The per-texture ownership and dirty-page checks already in this renderer serve the CPU-upload case fixed by nxnative's terrain patch. The two render and dispatch overlap changes need a separate ordering comparison. The integration keeps its existing measured-time producer.
+
+The first v14 cold test took roughly three minutes to create the heaviest Metal pipelines. The same shader cache on the warm run kept decoder timestamps about 55–70 ms behind the movie clock in steady playback. These measurements describe decoder delivery. Visual subtitle alignment and picture quality require play validation.
+
+The v14 development launcher enables the existing compressed-render, mid-pass-clear and 8-bit-index widening paths. The separate Metal validation probes for each passed, along with GPU-generated dispatch counts and texture retirement. With the flags enabled, the warmed v131072 run passed the compressed-target guard, built task/mesh pipelines and encoded the first mesh draw after the opening movie. The same run also exercised GPU-driven indirect compute and layered passes. Runtime logs establish that these operations were submitted. Scene appearance is still unverified.
