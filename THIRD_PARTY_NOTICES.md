@@ -59,3 +59,5 @@ OoT shader and host follow-up. The raw-address last-entry cache is adapted from 
 OoT depth, shared stores and zero-copy buffer creation follow [nxnative 473c9026](https://github.com/seedds/nxnative/commit/473c9026), [ffebfd59](https://github.com/seedds/nxnative/commit/ffebfd59), and [2d544e0d](https://github.com/seedds/nxnative/commit/2d544e0d), respectively (MIT). The depth and shared-store changes apply to Ampere shaders. The buffer fix reuses this runtime's dirty-page guard and applies to OoT only.
 
 OoT mesh output layout and texture view invalidation are adapted from [nxnative 3ccb7da0](https://github.com/seedds/nxnative/commit/3ccb7da0) and [0e4480d2](https://github.com/seedds/nxnative/commit/0e4480d2), MIT. Metal's point-size attribute is emitted only for point topology. The guest layout still counts the point-size word whenever the shader reserves it.
+
+OoT texture type-view resource ID caching is adapted from [Kolkka’s MacNativeGames PR #1836](https://github.com/ly05010419/MacNativeGames/pull/1836), revision `bd3e70e1d3f27f9fecddbf21271ef186517f90d0` (MIT). The experiment uses the existing view map and its retirement rules.

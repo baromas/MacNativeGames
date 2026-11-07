@@ -9988,6 +9988,32 @@ static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
 static uint64_t g_dummy_tex_rid[8][4], g_dummy_img_rid[8][4], g_dummy_tbuf_rid[4];
 /* TOTK: cached views of a texture as another texture type (2D <-> 2D array, 1 slice); keyed by the base texture object. */
 static NSMapTable<id, id<MTLTexture>> *g_type_views;
+/* Fast path for repeated pool lookups, adapted from Kolkka's MacNativeGames
+   PR #1836 (MIT). The map owns the textures. The cache only remembers IDs
+   and is invalidated under the registry lock when a map entry changes. */
+enum { TYPE_VIEW_CACHE_SIZE = 1 << 16 };
+static struct { const void *base; uint64_t rid; MTLTextureType type; } g_type_view_cache[TYPE_VIEW_CACHE_SIZE];
+static int type_view_cache_enabled(void) {
+#ifdef GAME_OOT
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("TOTK_TYPE_VIEW_CACHE");
+        enabled = setting && !strcmp(setting, "1");
+    }
+    return enabled;
+#else
+    return 0;
+#endif
+}
+static unsigned type_view_cache_slot(const void *base) {
+    return (unsigned)(((uintptr_t)base >> 4) * UINT64_C(0x9e3779b97f4a7c15) >> 48);
+}
+static void type_view_cache_forget(id base) {
+    if (!type_view_cache_enabled()) return;
+    const void *key = (__bridge const void *)base;
+    unsigned slot = type_view_cache_slot(key);
+    if (g_type_view_cache[slot].base == key) g_type_view_cache[slot].base = NULL;
+}
 /* Cached views retain their parent allocation. Evict after that allocation has been removed from
    residency by the completed-fence retirement path; a strong cache must not keep every upload alive.
    Caller cadence is bounded, and deferral also protects views used by the most recent submission. */
@@ -10001,6 +10027,7 @@ static void type_views_sweep_one(id key) {   // caller holds both locks
     id<MTLResource> allocation = base.buffer ?: (id<MTLResource>)base;
     if ([g_res_objects containsObject:allocation]) return;
     defer_obj_unref(view); defer_obj_unref(key);
+    type_view_cache_forget(key);
     [g_type_views removeObjectForKey:key]; g_type_retired_views++;
 }
 static void type_views_sweep_retired(void) {
@@ -10022,6 +10049,7 @@ static void type_view_drop_locked(id base) {
     static int on = -1; if (on < 0) { const char *e = getenv("TOTK_TYPE_VIEW_DROP"); on = !(e && !atoi(e)); }
     if (!on || !g_type_views || !((id<MTLTexture>)base).parentTexture) return;
     id<MTLTexture> v = [g_type_views objectForKey:base]; if (!v) return;
+    type_view_cache_forget(base);
     defer_obj_unref(v); defer_obj_unref(base); [g_type_views removeObjectForKey:base];
 }
 static id<MTLTexture> tex_type_view(id<MTLTexture> base, MTLTextureType want) {
@@ -10031,9 +10059,26 @@ static id<MTLTexture> tex_type_view(id<MTLTexture> base, MTLTextureType want) {
     if (v) defer_obj_unref(v);   // another type requested: earlier encoded draws may still use the old view
     v = [base newTextureViewWithPixelFormat:base.pixelFormat textureType:want levels:NSMakeRange(0, base.mipmapLevelCount) slices:NSMakeRange(0, 1)];
     if (!v) { RED_ONCE(46, "贴图类型视图建不出（%lu → %lu）", (unsigned long)base.textureType, (unsigned long)want); return nil; }
+    type_view_cache_forget(base);
     [g_type_views setObject:v forKey:base];
     static int said; if (said++ < 3) MLOG("texture type view: %lu -> %lu for a %lux%lu texture", (unsigned long)base.textureType, (unsigned long)want, (unsigned long)base.width, (unsigned long)base.height);
     return v;
+}
+static uint64_t tex_type_view_rid(id<MTLTexture> base, MTLTextureType want) {
+    const void *key = (__bridge const void *)base;
+    int enabled = type_view_cache_enabled();
+    unsigned slot = type_view_cache_slot(key);
+    if (enabled && g_type_view_cache[slot].base == key && g_type_view_cache[slot].type == want)
+        return g_type_view_cache[slot].rid;
+    id<MTLTexture> view = tex_type_view(base, want);
+    if (!view) return 0;
+    uint64_t rid = view.gpuResourceID._impl;
+    if (enabled) {
+        g_type_view_cache[slot].base = key;
+        g_type_view_cache[slot].type = want;
+        g_type_view_cache[slot].rid = rid;
+    }
+    return rid;
 }
 static id<MTLTexture> dummy_tex(int dtt, int dpf) {
     static __strong id<MTLTexture> cache[8][4];
@@ -10706,7 +10751,8 @@ static uint64_t pool_tex_rid(int id_, int dtt) {   // caller holds g_rmu; 0 = th
     void *tv = NULL; uint64_t rid = tex_fast_rid(id_, &tv); __unsafe_unretained id<MTLTexture> t = (__bridge id<MTLTexture>)tv; if (!t) return 0;
     MTLTextureType have_type = treg_view_type(id_, t);
     if ((int)have_type == dtt) return rid;
-    if ((have_type == MTLTextureType2D && dtt == MTLTextureType2DArray) || (have_type == MTLTextureType2DArray && dtt == MTLTextureType2D)) { id<MTLTexture> v = tex_type_view(t, (MTLTextureType)dtt); return v ? v.gpuResourceID._impl : 0; }
+    if ((have_type == MTLTextureType2D && dtt == MTLTextureType2DArray) || (have_type == MTLTextureType2DArray && dtt == MTLTextureType2D))
+        return tex_type_view_rid(t, (MTLTextureType)dtt);
     return 0;
 }
 static uint64_t g_pool_stat_frame;
@@ -18903,7 +18949,19 @@ int mtl_probe_texture_retire(void) {
     registry_lock();id<MTLTexture> again=tex_by_id(1);registry_unlock();
     if(again!=old[N-1])MDIE("texture retire: old descriptor failed to rebuild with current storage");checked++;
     id __weak replaced_type=[g_type_views objectForKey:again];
-    registry_lock();(void)tex_type_view(again,MTLTextureType2D);registry_unlock();
+    registry_lock();
+    if (type_view_cache_enabled()) {
+        uint64_t original_rid = tex_type_view_rid(again, MTLTextureType2DArray);
+        id<MTLTexture> original_view = replaced_type;
+        if (!original_rid || original_rid != original_view.gpuResourceID._impl ||
+            tex_type_view_rid(again, MTLTextureType2DArray) != original_rid)
+            MDIE("texture retire: cached ID differs from the live view");
+        checked++;
+    }
+    (void)tex_type_view(again,MTLTextureType2D);
+    if (type_view_cache_enabled() && g_type_view_cache[type_view_cache_slot((__bridge const void *)again)].base == (__bridge const void *)again)
+        MDIE("texture retire: replaced view ID still cached");
+    registry_unlock();
     if(!replaced_type)MDIE("texture retire: changing type released a view before its submission finished");checked++;
     enc_b_copy_texture_buffer(blit(),replaced_type,0,0,MTLOriginMake(0,0,0),MTLSizeMake(16,1,1),rb,0,128,128);
     mtl_sub_commit();mtl_finish();for(unsigned i=0;i<128;i++){if(((uint8_t *)rb.contents)[i]!=expected[i])MDIE("texture retire rebuilt view pixel%u",i);checked++;}
