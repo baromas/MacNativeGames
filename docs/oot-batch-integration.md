@@ -1,0 +1,31 @@
+# OoT host and shader integration, 2026-11-07
+
+This is a development branch, not a claim of parity with nxnative's playable OoT profile. It combines the interdependent graphics paths before another game boot. No game files or translated game shaders are part of the change.
+
+## Sources and boundaries
+
+- MD5Visual `feat/oot-boot` at `a2e9e756`: earlier boot work and native matrix layout, adapted in preceding commits.
+- Kolkka/MacNativeGames `aa723802..e11c84a6` (PR1836): task/mesh translation and Metal replay, indirect compute and mesh commands, buffer clears, packed image views, table texture/sampler handles, addressable pool residency, SDK22 output streams and clock entry points, PlayReport completion, and cached pool-liveness checks.
+- MIT nxnative `339d9f23`: expanded Ampere instruction lowering, via Kolkka's patch 0010. This retains our native HMMA and LDSM ordering; the reported-regressing matrix-chain optimization was not imported.
+- MIT nxnative PR1575 `79b34d15`: reserve primitive-index bytes for every 32-lane block, including padded lanes. The C# adapter already had extra padding, which happens to cover the 126-primitive case, but did not cover every other non-multiple of 32. The allocation now covers all blocks, including blocks needed for vertices.
+- MIT nxnative PR1543 `c254ba96`: below-target game-time correction. Adapted as a checked runtime producer in the same private-page/text-padding mechanism used by TOTK, rather than changing this tree's verified NSO rewrite hashes.
+
+Equivalent implementations are not stacked: this branch keeps its existing eventfd errno/status/core-handoff behavior, SDK22 codec/native-image contracts, audio renderer, verified decompression and thread IDs. The duplicate eventfd implementation and duplicate HMMA postprocessor from the incoming topic were removed.
+
+## Correctness changes
+
+Task and mesh stages are lowered to Metal object/mesh functions, including their stage memory and payload. Native direct/indirect mesh draws use those stages. Indirect dispatch counts and their driver-constant copies stay on the GPU timeline. Compute constants at NVN2 c0+4 are supplied in addition to the existing c0+0x200 grid. Buffer fills preserve arbitrary 32-bit values.
+
+NVN2 base instance is resolved to Metal's builtin in the translator before caching and reflection. Only the established scalar read is replaced. Other lanes or unrecognized function forms remain unfillable, and the old explicit zero-value diagnostic is still off by default. Pool reflection recognizes the matching texture/sampler table binding kinds. Shader chain v13 invalidates previous libraries coherently across runtime, seed tools and prebuilt translators.
+
+The game's original frame producer divides a constant by target FPS; at low render rates the game, including subtitle logic, can run behind the audio. The checked veneer retains the original division and takes the larger of it and the measured time scaled by that constant. It uses eight present samples, limits each interval to 0.1 s and the result to four 60 Hz steps, and resets on a backwards/non-advancing clock. This is separate from AV1 queue selection, which is already corrected in the preceding commit. `DM_FRAME_DELTA=0` retains the original step.
+
+The complete reconstruction network remains enabled. Incoming NDSR bypass is explicitly opt-in. The e11c84a6 game-barrier optimization is also opt-in until separately validated. No game boot was used while resolving integration/compile failures. GPU probes caught and corrected an accidental default-setting change during integration; the original existing defaults were restored before any game launch.
+
+## Verification and remaining work
+
+The first batch passed 1,489 tests (164 skipped) and the focused Metal probes. On the first isolated boot, the host presented at 3.509 s and decoded AV1 through movie time 21.833 s. At 30.27 s the runtime aborted on a vertex shader that already had a Metal base-instance parameter and also still read the NVN driver word. The initial adapter accepted only entry points that did not already declare that parameter. Synthetic Metal readbacks contain only constructed test data, never pixels from the running game. User window inspection remains disabled.
+
+OoT iOS packaging is not supported by this tree's IPA builder. The Mac and iOS NativeAOT translators are rebuilt together; host/graphics source compilation is checked separately and must not be described as an iOS device run.
+
+Still to investigate after the combined build: full 3D rendering and material correctness, subtitle/audio timing in play, long-session memory pressure, packed-image families and dynamically fetched image/buffer-texture handles. Optional async AV1 decoding, broad raw-memory range optimizations and prewarm manifests are not prerequisites silently assumed present here. A renderer build passing is not evidence that these are complete.

@@ -266,8 +266,15 @@ static unsigned char language_is(const int *language, const char *code) {
     return !strncmp(codes[*language], code, 8);
 }
 
+/* SDK 22 completes the offline PlayReport AsyncContext through the hidden x8 result pointer. */
+#ifdef GAME_NS2
+__attribute__((naked)) static void prepo_send(void) { __asm__("str xzr, [x8]\n    ret"); }
+#endif
 void *runtime_offline_override(const char *name) {
     static const struct { const char *name; void *fn; } map[] = {
+#ifdef GAME_NS2
+        {"_ZN2nn5prepo10PlayReport4SendERKNS_7account3UidE", prepo_send},
+#endif
         {"_ZN2nn2oe31EnterExitRequestHandlingSectionEv", enter_exit_section},
         {"_ZN2nn2oe31LeaveExitRequestHandlingSectionEv", leave_exit_section},
         {"_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE", display_version},

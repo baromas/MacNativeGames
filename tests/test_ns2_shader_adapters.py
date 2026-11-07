@@ -1,0 +1,102 @@
+"""Production C# adapters on constructed MSL/control headers, never game shaders."""
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import struct
+import subprocess
+import tempfile
+import unittest
+from xml.sax.saxutils import escape
+ROOT=Path(__file__).resolve().parents[1]
+CS=ROOT/'games/totk/tools/totk_xlate'
+DOTNET=shutil.which('dotnet') or '/usr/local/share/dotnet/dotnet'
+@unittest.skipUnless(platform.system()=='Darwin' and Path(DOTNET).is_file(),'native .NET/Metal toolchain required')
+class Ns2ShaderAdapters(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp=tempfile.TemporaryDirectory();cls.work=Path(cls.temp.name)
+        files=[CS/n for n in ('BaseInstance.cs','Pools.cs','MeshStage.cs')]+[ROOT/'tests/ns2_shader_adapter_probe.cs']
+        project='<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup><ItemGroup>'+''.join('<Compile Include="'+escape(str(f))+'"/>' for f in files)+'</ItemGroup></Project>'
+        (cls.work/'probe.csproj').write_text(project)
+        p=subprocess.run([DOTNET,'build',str(cls.work/'probe.csproj'),'-c','Release','-o',str(cls.work/'out')],capture_output=True,text=True,timeout=120)
+        if p.returncode:raise RuntimeError(p.stdout+p.stderr)
+    @classmethod
+    def tearDownClass(cls):cls.temp.cleanup()
+    def run_adapter(self,op,source,ok=True):
+        p=subprocess.run([DOTNET,str(self.work/'out/probe.dll'),op],input=source,text=True,capture_output=True,cwd=self.work,timeout=20)
+        self.assertEqual(p.returncode,0 if ok else 1,p.stdout+p.stderr)
+        return p.stdout if ok else p.stderr
+    def compile_metal(self,source):
+        (self.work/'synthetic.metal').write_text(source)
+        p=subprocess.run(['xcrun','-sdk','macosx','metal','-std=metal3.2','-c',str(self.work/'synthetic.metal'),'-o',str(self.work/'synthetic.air')],capture_output=True,text=True,timeout=60)
+        self.assertEqual(p.returncode,0,p.stderr)
+    def test_base_instance_lowering_and_unestablished_lanes(self):
+        head='#include <metal_stdlib>\nusing namespace metal;\nstruct Driver { float4 _m0[101]; };\nstruct Args { constant Driver* vp_c0 [[id(0)]]; };\n'
+        vertex='vertex float4 main0(constant Args& spvDescriptorSet0 [[buffer(0)]])\n{\nreturn float4(as_type<uint>((*spvDescriptorSet0.vp_c0)._m0[100].y));\n}\n'
+        original=head+vertex
+        lowered=self.run_adapter('base',original)
+        self.assertIn('[[base_instance]]',lowered);self.assertNotIn('_m0[100].y',lowered)
+        self.compile_metal(lowered)
+        self.assertEqual(self.run_adapter('base',lowered),lowered)
+        for bad in (original.replace('[100].y','[100].x'),original.replace('vertex ','fragment '),original.replace('return float4','return float4((*spvDescriptorSet0.vp_c0)._m0[100].x) + float4')):
+            self.assertEqual(self.run_adapter('base',bad),bad)
+    def test_pool_tables_renumber_ids_and_preserve_small_arrays(self):
+        src='struct spvDescriptorSetBuffer0\n{\n    array<texture2d<float>, 8192> cp_t_cb0_40000000 [[id(3)]];\n    array<sampler, 4096> cp_s_cb0_40000000 [[id(8195)]];\n    array<texture2d<float>, 4> fixed_tex [[id(12291)]];\n};\nfloat4 a = args.cp_t_cb0_40000000[t[idx[2]]].read(uint2(0));\n'
+        out=self.run_adapter('pool',src)
+        self.assertIn('constant spvPool_cp_t_cb0_40000000*',out)
+        self.assertIn('fixed_tex [[id(2)]]',out)
+        self.assertIn('min(uint(t[idx[2]]), args.cp_t_cb0_40000000->n)',out)
+        self.assertEqual(self.run_adapter('pool',out),out)
+    def mesh_request(self,mp=126,kind='ms'):
+        ctl=bytearray(0xc0);struct.pack_into('<II',ctl,0,0x98761234,0xc9)
+        struct.pack_into('<I',ctl,0x38,0x90);struct.pack_into('<II',ctl,0x40,0x90,0x90)
+        ctl[0x56]=6 if kind=='ts' else 7;struct.pack_into('<H',ctl,0x58,128)
+        struct.pack_into('<HH',ctl,0x60,128,mp)
+        area=bytearray(0x90);area[0x35]=0xf0
+        code=self.work/'area.bin';code.write_bytes(area)
+        return dict(variant='constructed',stage=kind,arch='sm86',mesh_control=ctl.hex(),code=str(code))
+    def test_mesh_padding_indices_fit_in_allocated_stage_memory(self):
+        for mp in (1,31,32,33,63,64,126,127,128,255,256):
+            rq=self.mesh_request(mp)
+            out=json.loads(self.run_adapter('prepare',json.dumps(rq)))
+            prim=out['mesh_layout'][3]
+            # Zero-output meshlets write every lane, including the final block's padding.
+            last=prim+4+3*((max(128,mp)+31)//32)*32-1
+            self.assertLess(last,out['shared']);self.assertLessEqual(out['shared'],32768)
+        old_33=prim=2304+4*4*128
+        self.assertGreaterEqual(prim+4+3*128-1,((old_33+4+3*33+15)//4+4)*4)
+    def test_object_and_mesh_wrappers_compile(self):
+        for kind in ('ts','ms'):
+            prepared=json.loads(self.run_adapter('prepare',json.dumps(self.mesh_request(kind=kind))))
+            words=prepared['shared']//4
+            source='#include <metal_stdlib>\nusing namespace metal;\ntemplate<typename T, size_t N> struct spvUnsafeArray { T e[N]; threadgroup T& operator[](size_t i) threadgroup { return e[i]; } };\n'
+            source+=f'kernel void main0(uint lane [[thread_position_in_threadgroup]])\n{{\n    threadgroup spvUnsafeArray<uint, {words}> stage_data;\n    stage_data[lane] = lane;\n}}\n'
+            wrapped=self.run_adapter('wrap',json.dumps(dict(source=source,info=prepared['mesh_stage'])))
+            self.assertIn('threadgroup_barrier(mem_flags::mem_threadgroup)',wrapped)
+            self.compile_metal(wrapped)
+    def test_malformed_control_is_rejected(self):
+        rq=self.mesh_request();rq['mesh_control']='00'*0xc0
+        self.assertIn('control section',self.run_adapter('prepare',json.dumps(rq),False))
+    def test_constructed_stage_store_through_production_native_service(self):
+        xlate=Path(os.environ.get('MNG_TEST_XLATE',ROOT/'games/totk/prebuilt/macos-arm64/totk_xlate'))
+        for kind in ('ts','ms'):
+            rq=self.mesh_request(kind=kind)
+            ctl=bytearray.fromhex(rq['mesh_control'])
+            # Construct MOV R0,1; stage store [RZ+offset],R0; EXIT, using ISA fields.
+            offset,mode=(4,0xb8) if kind=='ts' else (3,0x88)
+            code=b''.join(struct.pack('<QQ',lo,hi) for lo,hi in [
+                ((1<<32)|0x7802,0x000fc60000000f00),
+                ((offset<<40)|(255<<24)|0x7927,0x000fe80000000000|(mode<<8)),
+                (0x794d,0x000fea0003800000)])
+            area=bytearray(0x80)+code;area[0x35]=0xf0
+            Path(rq['code']).write_bytes(area)
+            struct.pack_into('<I',ctl,0x38,len(area));struct.pack_into('<II',ctl,0x40,len(area),len(area))
+            rq.update(mesh_control=ctl.hex(),tex={},img={},attr={},fout={},debug=True,variant='constructed_'+kind)
+            p=subprocess.run([str(xlate),'--service','--spirv-cross','(linked in)','--out',str(self.work),'--chain','synthetic-mesh-test'],input=json.dumps(rq)+'\n',capture_output=True,text=True,timeout=90)
+            self.assertEqual(p.returncode,0,p.stderr);self.assertTrue(json.loads(p.stdout)['ok'],p.stdout+p.stderr)
+            reflection=json.loads((self.work/(rq['variant']+'_b.json')).read_text())
+            self.assertEqual(reflection['mesh_stage']['kind'],kind)
+            self.assertEqual(reflection['drv_unfillable'],[])
+            self.compile_metal((self.work/(rq['variant']+'_b.metal')).read_text())
