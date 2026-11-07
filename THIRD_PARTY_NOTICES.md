@@ -61,3 +61,5 @@ OoT depth, shared stores and zero-copy buffer creation follow [nxnative 473c9026
 OoT mesh output layout and texture view invalidation are adapted from [nxnative 3ccb7da0](https://github.com/seedds/nxnative/commit/3ccb7da0) and [0e4480d2](https://github.com/seedds/nxnative/commit/0e4480d2), MIT. Metal's point-size attribute is emitted only for point topology. The guest layout still counts the point-size word whenever the shader reserves it.
 
 OoT texture type-view resource ID caching is adapted from [Kolkka’s MacNativeGames PR #1836](https://github.com/ly05010419/MacNativeGames/pull/1836), revision `bd3e70e1d3f27f9fecddbf21271ef186517f90d0` (MIT). The experiment uses the existing view map and its retirement rules.
+
+OoT direct mesh pass reuse is adapted from the approach in [Kolkka’s MacNativeGames PR #1836](https://github.com/ly05010419/MacNativeGames/pull/1836), revision `bd3e70e1d3f27f9fecddbf21271ef186517f90d0` (MIT). The local experiment keeps the existing ordering of indirect draws and checks the selected shader variant before extending a pass.

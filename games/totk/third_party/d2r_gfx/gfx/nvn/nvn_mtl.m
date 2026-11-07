@@ -134,6 +134,10 @@ static id<MTL4CommandBuffer> g_present_cb[3];
 static id<MTL4ArgumentTable> g_vt, g_ft, g_ct, g_up_ct;
 static id<MTL4ArgumentTable> g_ot, g_mt;   // NVN2 task (object) / mesh stages (mesh_tasks_draw; from games/mkw)
 static int g_mesh_active;
+static int g_mesh_pass_open, g_mesh_inpass, g_mesh_encoded;
+#ifdef GAME_OOT
+static uint64_t g_mesh_direct, g_mesh_indirect, g_mesh_shared;
+#endif
 static id<MTL4ArgumentTable> g_present_args[3];
 static id<MTLBuffer> g_present_uv[3];
 static id<MTLBuffer> g_present_probe_src[3], g_present_probe_dst[3];
@@ -5166,7 +5170,7 @@ static void nt_watch_after_pass(void);
 static uint8_t g_nt_pass_clear[8]; static MTLClearColor g_nt_pass_cc[8]; static unsigned g_nt_pass_draws;   /* TOTK_NAN_TRACE watch log: how the current pass began */
 static const char *nan_trace_prefix(void);
 #include "totk_hdr_shadow.h"
-static void rp_end(void) { if (g_enc) {
+static void rp_end(void) { g_mesh_pass_open = 0; if (g_enc) {
     ghost_flush();
     if (enc_label_on() && !g_rs_active) { static uint64_t lf = ~0ull, base; uint64_t f = atomic_load(&g_cur_frame); if (f != lf) { lf = f; base = g_stat_pass - 1; }   // 帧内序号：同一趟每帧同名，表里才能按名归并 | Intra-frame serial: the same pass has the same name every frame, so the table can aggregate by name
         [(id)g_enc setLabel:[NSString stringWithFormat:@"p%02llu %dx%d %s d%d", (unsigned long long)(g_stat_pass - base), g_el_w, g_el_h, g_el_key[0] ? g_el_key : "-", g_el_draws]]; }
@@ -10760,6 +10764,13 @@ static uint64_t pool_table(int samp, int dtt, int dpf, int base) {   // caller h
     uint64_t fr = atomic_load(&g_cur_frame); if (fr != g_pool_frame) { g_pool_frame = fr; g_pool_spent = 0;
         if (fr / 300 != g_pool_stat_frame / 300) { static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
             MLOG("[pool] up to frame %llu: %llu table walks, %.1f ms a frame; liveness %llu kernel reads, %llu remembered; draw passes %llu without the full barrier, %llu with it", (unsigned long long)fr, (unsigned long long)g_pool_walks, (double)g_pool_walk_ns * tb.numer / tb.denom / 1e6 / MAX(1, (double)(fr - g_pool_stat_frame)), (unsigned long long)g_pool_live_reads, (unsigned long long)g_pool_live_hits, (unsigned long long)g_bar_skip, (unsigned long long)g_bar_full); g_bar_skip = g_bar_full = 0;
+#ifdef GAME_OOT
+            if (g_mesh_direct || g_mesh_indirect)
+                MLOG("[mesh-pass] frame %llu: %llu direct, %llu indirect, %llu reused the open pass",
+                     (unsigned long long)fr, (unsigned long long)g_mesh_direct,
+                     (unsigned long long)g_mesh_indirect, (unsigned long long)g_mesh_shared);
+            g_mesh_direct = g_mesh_indirect = g_mesh_shared = 0;
+#endif
             g_pool_stat_frame = fr; g_pool_walks = g_pool_walk_ns = g_pool_live_reads = g_pool_live_hits = 0; } }
     int k = -1, fre = -1; for (int i = 0; i < POOL_KEYS; i++) { if (!g_ptab[i].copy) { if (fre < 0) fre = i; } else if (g_ptab[i].samp == samp && g_ptab[i].dtt == dtt && g_ptab[i].dpf == dpf && g_ptab[i].base == base) { k = i; break; } }
     if (k >= 0 && g_ptab[k].sub == g_sub_serial && g_ptab[k].epoch == g_arena_epoch) return g_ptab[k].gpu;
@@ -14686,6 +14697,7 @@ static void mesh_encode(id<MTL4RenderCommandEncoder> en, NvProg *pr) {
     [en setArgumentTable:g_ot atStages:MTLRenderStageObject]; [en setArgumentTable:g_mt atStages:MTLRenderStageMesh];
     if (ts) encode_args((id)en, ts, 3, 0);
     encode_args((id)en, ms, 4, 0);
+    g_mesh_encoded = 1;
     if (g_mesh_ind_args) {
         /* The copies of the game's record ran before this pass: they, and the culling that wrote the record, come first. */
         [en barrierAfterQueueStages:MTLStageBlit | MTLStageDispatch beforeStages:MTLStageObject | MTLStageMesh visibilityOptions:MTL4VisibilityOptionDevice];
@@ -14718,11 +14730,61 @@ static void indirect_read(uint64_t address, void *out, size_t size) {
     memcpy(out, (const uint8_t *)staging.contents + dest, size);
 }
 #endif
+/* The NVN state updates between direct mesh draws do not consume attachment
+   contents. End the pass at every other replay operation, including barriers
+   and list boundaries. Inspired by Kolkka PR #1836 (MIT). */
+static int mesh_pass_state_op(unsigned op) {
+    switch (op) {
+    case OP_MESH_TASKS:
+    case OP_BIND_PROGRAM: case OP_BIND_STATE:
+    case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP:
+    case OP_VIEWPORTS: case OP_SCISSOR: case OP_DEPTH_RANGE:
+    case OP_STENCIL: case OP_POLY_OFFSET: case OP_BLEND_COLOR:
+        return 1;
+    default:
+        return 0;
+    }
+}
+static int mesh_pass_eligible(const p_mesh_tasks *mesh) {
+#ifdef GAME_OOT
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("TOTK_MESH_INPASS");
+        enabled = setting && !strcmp(setting, "1");
+    }
+    return enabled && !mesh->ind && !g_game_barrier && !g_defer.active &&
+        !g_cg_pending && !g_fz.active && !g_lay.active && !g_hoist_n && !g_rt_merged;
+#else
+    (void)mesh;
+    return 0;
+#endif
+}
+static int mesh_program_read_only(NvProg *program) {
+    if (!program || !program->sh[4]) return 0;
+    for (unsigned stage = 0; stage < 5; stage++) {
+        NvShader *shader = program->sh[stage];
+        if (!shader) continue;
+        for (int i = 0; i < shader->rf.nb; i++) {
+            const nvn_rbind *binding = &shader->rf.b[i];
+            if (binding->rw || binding->kind == NVN_RB_GMEML) return 0;
+        }
+    }
+    return 1;
+}
 static void mesh_tasks_draw(const p_mesh_tasks *mesh) {
     if (!mesh->ind && !mesh->count) return;
     static int skip = -1; if (skip < 0) { const char *e = getenv("TOTK_MESH_SKIP"); skip = e && atoi(e); if (skip) MLOG("[mesh] TOTK_MESH_SKIP=1: task / mesh draws dropped (diagnostic)"); }
     if (skip || !S.prog) return;
-    rp_end();
+#ifdef GAME_OOT
+    if (mesh->ind) g_mesh_indirect++;
+    else g_mesh_direct++;
+#endif
+    g_mesh_inpass = mesh_pass_eligible(mesh);
+    if (!g_mesh_inpass || !g_mesh_pass_open) rp_end();
+#ifdef GAME_OOT
+    uint64_t previous_pass = g_stat_pass;
+    int joining = g_mesh_inpass && g_mesh_pass_open;
+#endif
     g_mesh_ind_args = g_mesh_ind_first = 0;
     if (mesh->ind) {   /* the record is {count, first} (nxnative nvn_geometry.inc), often written by the GPU's culling earlier in the frame: the GPU copies it on its own timeline, so the CPU never waits (a readback here took 85 % of the replay: 3 fps) */
         void *source; uint64_t so;
@@ -14734,9 +14796,18 @@ static void mesh_tasks_draw(const p_mesh_tasks *mesh) {
         enc_b_copy_buffer(ce, src, so, ab, ao, 4); enc_b_copy_buffer(ce, src, so + 4, ab, ao + 16, 4);
         enc_b_end(g_blit); g_blit = nil;
         g_mesh_ind_args = ab.gpuAddress + ao; g_mesh_ind_first = ab.gpuAddress + ao + 16; }
+    g_mesh_encoded = 0;
     g_mesh_active = 1; g_mesh_first = mesh->first; g_mesh_count = mesh->ind ? 1 : mesh->count;
     p_draw synthetic = {.prim = 4, .count = 3, .instances = 1}; draw(&synthetic, NULL);
-    rp_end(); g_mesh_active = 0; g_mesh_ind_args = 0; g_pso_dirty = 1; args_dirty_all();
+    if (g_mesh_inpass && g_mesh_encoded && g_enc && !rs_using(g_enc)) {
+        g_mesh_pass_open = 1;
+#ifdef GAME_OOT
+        if (joining && g_stat_pass == previous_pass) g_mesh_shared++;
+#endif
+    } else {
+        rp_end();
+    }
+    g_mesh_active = g_mesh_inpass = 0; g_mesh_ind_args = 0; g_pso_dirty = 1; args_dirty_all();
 }
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "绘制前没有绑定程序"); g_draw_skip[0]++; return; }
@@ -14758,6 +14829,12 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (pr && pr->geo && !g_geo_ras.pr) { geo_draw(pr, dw, di); return; }   // a geometry stage: capture, kernel, then its output through here (nvn_geometry_rt.inc)
     if (g_nupd) upd_guard_draw(pr, di);   // TOTK: before any encoder or texture preparation of this draw
     { int fit = pr ? prog_fit(pr) : 0; if (fit < 0) { draw_skipped(); return; } if (fit) g_pso_dirty = 1; }
+    /* Check the variant selected for this draw. Storage writes keep the
+       original pass boundary and its ordering even in the experiment. */
+    if (g_mesh_active && g_mesh_inpass && !mesh_program_read_only(pr)) {
+        g_mesh_inpass = 0;
+        rp_end();
+    }
     if (skv_on()) { g_skv_draws++; if (skv_check((__bridge const void *)pr, dw, di)) return; }   // measurement experiment: skip draws invisible in the last frames
     geometry_dump(pr, dw, di);
     if (di && di->itype == 0 && di->count && pend_hits(di->ibuf, (uint64_t)di->count)) widen_indices_gpu(di);
@@ -16273,6 +16350,7 @@ void mtl_exec(const uint8_t *p) {
         if (g_eye_pass && (h.op == OP_DRAW || h.op == OP_DRAW_IDX)) g_b2_draws[g_eye_pass - 1][g_eye_region == 3 ? 1 : 0]++;   // stereo B2: draws per pass, own marks / shared
         if (g_eye_pass == 1 && (h.op == OP_SIGNAL_EVENT || (!g_b2_rep && (h.op == OP_REPORT_COUNTER || h.op == OP_RESET_COUNTER)))) { p += h.size; continue; }
         g_exec_cur = p;   // 写回前瞻的扫描起点：结束通道的那条操作（含） | Scan start point of the store lookahead: the operation that ends the render pass (inclusive)
+        if (g_mesh_pass_open && !mesh_pass_state_op(h.op)) rp_end();
         if (p == g_defer_pend) { for (int gi = 0; gi < 4; gi++) if (g_defer_slots[gi].active && g_defer_slots[gi].p_end_op == p) g_defer_slots[gi].in_p = 0; g_defer_pend = NULL; }
         sdx_seq(p);
         if (h.op == OP_SET_RT) rt_toggle_poll();
