@@ -1,2 +1,2 @@
 // Separate experimental TOTK cache identity; D2R shader caches are rejected.
-#define DMSH_CHAIN "totk-native-v15-ns2-depth-and-stage-stores"
+#define DMSH_CHAIN "totk-native-v16-ns2-mesh-layout"

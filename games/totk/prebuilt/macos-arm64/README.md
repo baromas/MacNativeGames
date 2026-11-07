@@ -43,4 +43,4 @@ by preparing the whole 1.4.3 seed with both builds from the same inputs: all 95,
 indexes) byte-identical; the translation took as long (268 s / 270 s: the preparing script's 8 workers wait on each
 reply) for about half the CPU (508 s instead of 961 s, system time 90 s instead of 294 s).
 
-The current chain `totk-native-v15-ns2-depth-and-stage-stores` includes native HMMA, task/mesh stages, the NVN2 base-instance fix and the updated Ampere emitters. See `docs/oot-batch-integration.md`. Matching Mac and iOS translator outputs are rebuilt together.
+The current chain `totk-native-v16-ns2-mesh-layout` adds separate vertex/primitive mesh attribute blocks and decodes the NVN2 primitive topology. It retains native HMMA, the NVN2 base-instance fix and the updated Ampere emitters. See `docs/oot-batch-integration.md`. Matching Mac and iOS translator outputs are rebuilt together.

@@ -69,10 +69,10 @@ class Ns2ShaderAdapters(unittest.TestCase):
             out=json.loads(self.run_adapter('prepare',json.dumps(rq)))
             prim=out['mesh_layout'][3]
             # Zero-output meshlets write every lane, including the final block's padding.
-            last=prim+4+3*((max(128,mp)+31)//32)*32-1
+            last=prim+4+3*((mp+31)//32)*32-1
             self.assertLess(last,out['shared']);self.assertLessEqual(out['shared'],32768)
         old_33=prim=2304+4*4*128
-        self.assertGreaterEqual(prim+4+3*128-1,((old_33+4+3*33+15)//4+4)*4)
+        self.assertGreaterEqual(prim+4+3*64-1,((old_33+4+3*33+15)//4+4)*4)
     def test_object_and_mesh_wrappers_compile(self):
         for kind in ('ts','ms'):
             prepared=json.loads(self.run_adapter('prepare',json.dumps(self.mesh_request(kind=kind))))
@@ -85,6 +85,36 @@ class Ns2ShaderAdapters(unittest.TestCase):
     def test_malformed_control_is_rejected(self):
         rq=self.mesh_request();rq['mesh_control']='00'*0xc0
         self.assertIn('control section',self.run_adapter('prepare',json.dumps(rq),False))
+
+    def test_mesh_vertex_and_primitive_attribute_blocks_are_separate(self):
+        for verts,topology in ((1,'point'),(2,'line'),(3,'triangle')):
+            with self.subTest(topology=topology):
+                rq=self.mesh_request(mp=64)
+                ctl=bytearray.fromhex(rq['mesh_control'])
+                ctl[0x5f]=verts
+                ctl[0x68]=0x80
+                struct.pack_into('<I',ctl,0x64,0x90)
+                struct.pack_into('<II',ctl,0x40,0x110,0x110)
+                code=Path(rq['code'])
+                area=bytearray(code.read_bytes())+bytearray(0x80)
+                area[0x35]=0xf8         # point size, then four position components
+                area[0x36]=0x10         # vertex attribute 1, x only
+                area[0x90+0x36]=0x0f    # four per-primitive attribute 0 components
+                code.write_bytes(area)
+                rq['mesh_control']=ctl.hex()
+                prepared=json.loads(self.run_adapter('prepare',json.dumps(rq)))
+                self.assertEqual(prepared['mesh_layout'],[0,64,2304,6400])
+                words=prepared['shared']//4
+                source='#include <metal_stdlib>\nusing namespace metal;\ntemplate<typename T, size_t N> struct spvUnsafeArray { T e[N]; threadgroup T& operator[](size_t i) threadgroup { return e[i]; } };\n'
+                source+=f'kernel void main0(uint lane [[thread_position_in_threadgroup]])\n{{\n    threadgroup spvUnsafeArray<uint, {words}> stage_data;\n    stage_data[lane] = lane;\n}}\n'
+                wrapped=self.run_adapter('wrap',json.dumps(dict(source=source,info=prepared['mesh_stage'])))
+                self.assertIn(f'metal::topology::{topology}',wrapped)
+                self.assertIn(f'np * {verts}u',wrapped)
+                self.assertIn('576u + (v / 32u) * 192u',wrapped)
+                self.assertIn('1344u + (p / 32u) * 128u',wrapped)
+                self.assertEqual('[[point_size]]' in wrapped,verts==1)
+                self.assertIn('o.position = float4(as_type<float>(stage_data[b + 32u])',wrapped)
+                self.compile_metal(wrapped)
     def test_constructed_stage_store_through_production_native_service(self):
         xlate=Path(os.environ.get('MNG_TEST_XLATE',ROOT/'games/totk/prebuilt/macos-arm64/totk_xlate'))
         for kind in ('ts','ms'):

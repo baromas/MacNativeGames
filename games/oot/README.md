@@ -14,7 +14,7 @@ TOTK_GPU_ALLOW_SUBMIT=1 TOTK_GPU_BLOCKRT=1 TOTK_GPU_MIDCLEAR=1 TOTK_GPU_WIDEN=1 
   build/totk-native-oot rewritten/oot boot
 ```
 
-Use the matching rebuilt NativeAOT translator and shader chain `totk-native-v15-ns2-depth-and-stage-stores`. Old shader libraries cannot be reused unchanged after this chain update. There is no packaged OoT .app/iOS build flow yet.
+Use the matching rebuilt NativeAOT translator and shader chain `totk-native-v16-ns2-mesh-layout`. Old shader libraries cannot be reused unchanged after this chain update. There is no packaged OoT .app/iOS build flow yet.
 
 The complete reconstruction network runs by default. Lossy `TOTK_NDSR_BYPASS=1` and the separate direct-movie experiment are diagnostic opt-ins. `TOTK_BARRIER_GAME=1` enables the newly imported barrier-order optimization; it remains off while this integration is being validated. `DM_FRAME_DELTA=0` selects the original fixed game step for comparison. No image-quality trade-off is required by the default path.
 

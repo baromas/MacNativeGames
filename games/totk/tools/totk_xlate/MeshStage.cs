@@ -12,9 +12,14 @@ using System.Text.RegularExpressions;
 
 static partial class ShaderService
 {
-    static JsonArray MeshComponents(byte[] sph) {
+    const int MeshPointSize = -1;
+
+    static JsonArray MeshComponents(byte[] sph, bool primitive = false) {
         var a = new JsonArray();
-        for (int c = 0; c < 4; c++) if ((sph[0x35] & (1 << (4 + c))) != 0) a.Add((JsonNode)new JsonArray(null, JsonValue.Create(c)));
+        if (!primitive) {
+            if ((sph[0x35] & 8) != 0) a.Add((JsonNode)new JsonArray(MeshPointSize, 0));
+            for (int c = 0; c < 4; c++) if ((sph[0x35] & (1 << (4 + c))) != 0) a.Add((JsonNode)new JsonArray(null, JsonValue.Create(c)));
+        }
         for (int n = 0; n < 32; n++) for (int c = 0; c < 4; c++)
             if (((sph[0x36 + n / 2] >> (4 * (n % 2))) & (1 << c)) != 0) a.Add((JsonNode)new JsonArray(n, c));
         return a;
@@ -44,18 +49,23 @@ static partial class ShaderService
         else {
             int mv = BitConverter.ToUInt16(ctl, 0x60), mp = BitConverter.ToUInt16(ctl, 0x62);
             if (mv < 1 || mv > 256 || mp < 1 || mp > 256) throw new RuntimeError("mesh output counts exceed supported Metal limits");
+            int verts = ctl[0x5f] == 0 ? 3 : ctl[0x5f];
+            if (verts is < 1 or > 3) throw new RuntimeError("invalid mesh primitive vertex count");
             JsonArray comps = MeshComponents(area), pcomps = new();
             if ((ctl[0x68] & 0x80) != 0) {
                 uint off = BitConverter.ToUInt32(ctl, 0x64);
                 if (off == 0 || (ulong)off + 0x80 > (ulong)area.Length) throw new RuntimeError("invalid per-primitive SPH offset");
-                pcomps = new JsonArray(MeshComponents(area.AsSpan((int)off, 0x80).ToArray()).Where(c => c[0] != null).Select(c => c.DeepClone()).ToArray());
+                pcomps = MeshComponents(area.AsSpan((int)off, 0x80).ToArray(), primitive: true);
             }
-            info["max_v"] = mv; info["max_p"] = mp; info["comps"] = comps; info["pcomps"] = pcomps; info["task"] = ctl[0x5e] != 0;
-            int blocks = Math.Max(Math.Max((mv + 31) / 32, (mp + 31) / 32), 1);
-            prim = output + blocks * Math.Max(comps.Count + pcomps.Count, 1) * 0x80;
+            info["max_v"] = mv; info["max_p"] = mp; info["verts"] = verts;
+            info["comps"] = comps; info["pcomps"] = pcomps; info["task"] = ctl[0x5e] != 0;
+            // NVN2 writes all vertex blocks, then all per-primitive blocks.
+            // nxnative 3ccb7da0, MIT.
+            int vBlocks = (mv + 31) / 32, pBlocks = (mp + 31) / 32;
+            prim = output + Math.Max(vBlocks * comps.Count + pBlocks * pcomps.Count, 1) * 0x80;
             // Zero-output meshlets can still write the padding lanes of every 32-lane block.
             // nxnative PR1575 (79b34d15): reserve those bytes, not only max_p triangles.
-            words = (prim + 4 + 3 * blocks * 32 + 15) / 4 + 4;
+            words = (prim + 4 + verts * pBlocks * 32 + 15) / 4 + 4;
         }
         if (words * 4 > 32768) throw new RuntimeError("mesh stage memory exceeds Metal threadgroup limit");
         info["mesh_layout"] = new JsonArray(0, 0x40, output, prim);
@@ -112,26 +122,34 @@ static partial class ShaderService
         }
         var comps = info["comps"].AsArray().Select(c => (n: c[0] == null ? (int?)null : (int)c[0], c: (int)c[1])).ToList();
         var pcomps = info["pcomps"].AsArray().Select(c => (n: (int?)c[0], c: (int)c[1])).ToList();
-        var gens = comps.Where(c => c.n != null).Select(c => c.n.Value).Distinct().OrderBy(n => n).ToList();
+        var gens = comps.Where(c => c.n >= 0).Select(c => c.n.Value).Distinct().OrderBy(n => n).ToList();
         var pgens = pcomps.Select(c => c.n.Value).Distinct().OrderBy(n => n).ToList();
-        int mv = (int)info["max_v"], mp = (int)info["max_p"], stride = Math.Max(comps.Count + pcomps.Count, 1) * 32;
+        int mv = (int)info["max_v"], mp = (int)info["max_p"], verts = (int)info["verts"];
+        int vStride = Math.Max(comps.Count, 1) * 32, pStride = Math.Max(pcomps.Count, 1) * 32;
+        int pOutput = output + ((mv + 31) / 32) * comps.Count * 32;
+        int pointSize = comps.IndexOf((MeshPointSize, 0));
+        bool emitPointSize = verts == 1 && pointSize >= 0;
+        string topology = verts == 1 ? "point" : verts == 2 ? "line" : "triangle";
         bool task = (bool)info["task"];
-        string Lanes(List<(int? n, int c)> cs, int? n, int off) => string.Join(", ", Enumerable.Range(0, 4).Select(c => cs.Contains((n, c)) ? $"as_type<float>({arr}[b + {(off + cs.IndexOf((n, c))) * 32}u])" : c == 3 ? "1.0" : "0.0"));
-        string sets = string.Concat(new int?[] { null }.Concat(gens.Select(n => (int?)n)).Select(n => $"        o.{(n == null ? "position" : "a" + n)} = float4({Lanes(comps, n, 0)});\n"));
-        string psets = string.Concat(pgens.Select(n => $"        q.p{n} = float4({Lanes(pcomps, n, comps.Count)});\n"));
-        head += "struct dm_vertex_t {\n    float4 position [[position]];\n" + string.Concat(gens.Select(n => $"    float4 a{n} [[user(locn{n})]];\n")) + "};\n";
+        string Lanes(List<(int? n, int c)> cs, int? n) => string.Join(", ", Enumerable.Range(0, 4).Select(c => cs.Contains((n, c)) ? $"as_type<float>({arr}[b + {cs.IndexOf((n, c)) * 32}u])" : c == 3 ? "1.0" : "0.0"));
+        string sets = string.Concat(new int?[] { null }.Concat(gens.Select(n => (int?)n)).Select(n => $"        o.{(n == null ? "position" : "a" + n)} = float4({Lanes(comps, n)});\n"));
+        if (emitPointSize) sets += $"        o.point_size = as_type<float>({arr}[b + {pointSize * 32}u]);\n";
+        string psets = string.Concat(pgens.Select(n => $"        q.p{n} = float4({Lanes(pcomps, n)});\n"));
+        head += "struct dm_vertex_t {\n    float4 position [[position]];\n" +
+                (emitPointSize ? "    float point_size [[point_size]];\n" : "") +
+                string.Concat(gens.Select(n => $"    float4 a{n} [[user(locn{n})]];\n")) + "};\n";
         if (pgens.Count > 0) head += "struct dm_prim_t {\n" + string.Concat(pgens.Select(n => $"    float4 p{n} [[user(locn{n})]];\n")) + "};\n";
-        head += $"using dm_mesh_t = metal::mesh<dm_vertex_t, {(pgens.Count > 0 ? "dm_prim_t" : "void")}, {mv}, {mp}, metal::topology::triangle>;\n";
+        head += $"using dm_mesh_t = metal::mesh<dm_vertex_t, {(pgens.Count > 0 ? "dm_prim_t" : "void")}, {mv}, {mp}, metal::topology::{topology}>;\n";
         string Entry(string name, bool gl) {
             var args = pars.Append("dm_mesh_t dm_out").ToList();
             if (task) args.Add("const object_data dm_payload_t& dm_pl [[payload]]");
             args.AddRange(extra); args.Add("constant uint* dm_first [[buffer(29)]]");
             return $"[[mesh]] void {name}({string.Join(", ", args)})\n{{\n" + start +
                 (task ? $"    for (uint i = dm_lid; i < {payw}u; i += {thr}u) {arr}[{input}u + i] = dm_pl.w[i];\n" + barrier + $"    if (dm_lid == 0u) {{ {arr}[{sys}] = dm_tg; {arr}[{input}] = dm_tg; }}\n" : $"    if (dm_lid == 0u) {arr}[{sys}] = dm_first[0] + dm_tg;\n") + barrier + $"    {call}\n" + barrier +
-                $"    uint np = min(({arr}[{prim / 4}] >> 24) & 0xffu, {mp}u);\n    if (dm_lid == 0u) dm_out.set_primitive_count(np);\n    for (uint v = dm_lid; v < {mv}u; v += {thr}u)\n    {{\n        uint b = {output}u + (v / 32u) * {stride}u + (v % 32u);\n        dm_vertex_t o;\n" + sets +
+                $"    uint np = min(({arr}[{prim / 4}] >> 24) & 0xffu, {mp}u);\n    if (dm_lid == 0u) dm_out.set_primitive_count(np);\n    for (uint v = dm_lid; v < {mv}u; v += {thr}u)\n    {{\n        uint b = {output}u + (v / 32u) * {vStride}u + (v % 32u);\n        dm_vertex_t o;\n" + sets +
                 (gl ? "        o.position.z = fma(o.position.z, 0.5, o.position.w * 0.5);\n" : "") + "        dm_out.set_vertex(v, o);\n    }\n" +
-                (pgens.Count > 0 ? $"    for (uint p = dm_lid; p < np; p += {thr}u)\n    {{\n        uint b = {output}u + (p / 32u) * {stride}u + (p % 32u);\n        dm_prim_t q;\n" + psets + "        dm_out.set_primitive(p, q);\n    }\n" : "") +
-                $"    for (uint i = dm_lid; i < np * 3u; i += {thr}u) {{ uint a = {prim + 4}u + i; dm_out.set_index(i, ({arr}[a / 4u] >> ((a % 4u) * 8u)) & 0xffu); }}\n}}\n";
+                (pgens.Count > 0 ? $"    for (uint p = dm_lid; p < np; p += {thr}u)\n    {{\n        uint b = {pOutput}u + (p / 32u) * {pStride}u + (p % 32u);\n        dm_prim_t q;\n" + psets + "        dm_out.set_primitive(p, q);\n    }\n" : "") +
+                $"    for (uint i = dm_lid; i < np * {verts}u; i += {thr}u) {{ uint a = {prim + 4}u + i; dm_out.set_index(i, ({arr}[a / 4u] >> ((a % 4u) * 8u)) & 0xffu); }}\n}}\n";
         }
         return src + "\n" + head + Entry("main0", true) + "\n" + Entry("main0_z", false);
     }
