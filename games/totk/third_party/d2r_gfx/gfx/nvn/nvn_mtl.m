@@ -845,11 +845,31 @@ void mtl_pool_addressed(const void *mem, uint64_t size) {
 void mtl_pool_res_stats(uint64_t v[4]) {   // registered pools, their bytes, pools / bytes in the residency set
     pthread_mutex_lock(&g_mu); v[0] = (uint64_t)g_pools.n; v[1] = g_pool_bytes; v[2] = g_pool_res_n; v[3] = g_pool_res_bytes; pthread_mutex_unlock(&g_mu);
 }
+#ifdef GAME_OOT
+/* Metal can accept a zero-copy buffer made over a read-only CPU page, then
+   silently discard every GPU write through that buffer. Make the backing
+   writable during creation, including a shared page at either boundary.
+   Read-only upload buffers still use their separate creation path. */
+static id<MTLBuffer> pool_writable_buffer(uintptr_t a, uintptr_t b) {
+    void *token;
+    if (!nvn_dirty_buffer_begin((void *)a, b - a, &token)) return nil;
+    id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
+    nvn_dirty_buffer_end(token);
+    return buf;
+}
+#endif
 void mtl_pool_add(const void *mem, uint64_t size) {
     mtl_init(); g_reg_gen++;
     uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)mem, hi = lo + size;
     uintptr_t a = lo & ~(pg - 1), b = (hi + pg - 1) & ~(pg - 1);
     pool_range_check(a, b, mem, size);
+#ifdef GAME_OOT
+    id<MTLBuffer> buf = pool_writable_buffer(a, b);
+    for (int k = 0; !buf && k < 8; k++) {
+        usleep(2000 << k);
+        buf = pool_writable_buffer(a, b);
+    }
+#else
     id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
     /* TOTK (2026-10-24, crash at boot 12:36): Metal refused the zero-copy buffer while pipelining had pages of the range
        write-protected (a guest thread was faulting on one at the same moment). Retry with the tracked pages writable for
@@ -861,6 +881,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
         MLOG("【红】内存池 %p+%#llx 零拷贝缓冲第 %d 次重试%s（保护页 %s）", mem, (unsigned long long)size, k + 1, buf ? "成功" : "失败", tok ? "临时解开" : "无");
         if (!buf) usleep(2000 << k);
     }
+#endif
     if (!buf) MDIE("内存池 %p+%#llx 建零拷贝缓冲失败", mem, (unsigned long long)size);
     pthread_mutex_lock(&g_mu);
     if (pidx_overlaps(&g_pools, lo, hi)) { static int said; if (said++ < 8) MLOG("memory pool %p+%#llx overlaps a registered pool (%d live)", mem, (unsigned long long)size, g_pools.n); }
@@ -6075,13 +6096,11 @@ void mtl_variant_stats(uint64_t *n, uint64_t *ns, uint64_t *pre, uint64_t *bg, u
 static int drv_fillable(int stage, int bank, unsigned off) {
     if (bank == 2) return (off >= 0x20 && off < 0x120) || (off >= 0x168 && off < 0x968);
     switch (stage) {
-#ifdef GAME_NS2
     case 0: return (off >= 0x110 && off < 0x210) || off == 0x610;
-#else
-    case 0: return (off >= 0x110 && off < 0x210) || off == 0x610;
-#endif
     case 1: return off >= 0x510 && off < 0x610;
 #ifdef GAME_NS2
+    case 3: return off >= 0x670 && off < 0x770;   /* task storage buffers */
+    case 4: return off >= 0x770 && off < 0x870;   /* mesh storage buffers */
     case 5: return off < 0x10 || (off >= 0x200 && off < 0x410);   /* NVN2: the workgroup counts at c0 + 4 */
 #else
     case 5: return off >= 0x200 && off < 0x410;

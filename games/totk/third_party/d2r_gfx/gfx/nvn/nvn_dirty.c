@@ -209,6 +209,49 @@ void nvn_dirty_gpu_write_end(void *tok) {
     for (uintptr_t p = t->p0; p <= t->p1; p++) if (t->was[p - t->p0]) { mp(t->r->base + (p << g_shift), g_pg, PROT_READ); atomic_store(&t->r->state[p], PG_PROT); }
     free(t->was); free(t);
 }
+#ifdef GAME_OOT
+typedef struct {
+    size_t count;
+    void *ranges[];
+} buffer_write_tok;
+
+void nvn_dirty_buffer_end(void *token) {
+    buffer_write_tok *t = token;
+    if (t) {
+        for (size_t i = 0; i < t->count; i++) nvn_dirty_gpu_write_end(t->ranges[i]);
+        free(t);
+    }
+    pthread_mutex_unlock(&g_slot_mu);
+}
+
+/* Serialize a pool's buffer creation with page protection and range retirement.
+   Aligned buffer bounds may overlap an older tracked pool by just one page.
+   Reuse the GPU-write permission window so this does not change dirty stamps.
+   As with GPU writeback, the caller owns the storage during this window. */
+int nvn_dirty_buffer_begin(void *addr, size_t len, void **token) {
+    pthread_mutex_lock(&g_slot_mu);
+    buffer_write_tok *t = NULL;
+    uintptr_t a = (uintptr_t)addr, b = a + len;
+    int n = atomic_load(&g_nr);
+    for (int i = 0; i < n; i++) {
+        range_t *r = &g_r[i];
+        if (!atomic_load(&r->live) || a >= r->end || b <= r->base) continue;
+        uintptr_t lo = a > r->base ? a : r->base;
+        uintptr_t hi = b < r->end ? b : r->end;
+        if (!t) t = calloc(1, sizeof *t + (size_t)n * sizeof t->ranges[0]);
+        if (!t) goto failed;
+        void *part = nvn_dirty_gpu_write_begin((void *)lo, hi - lo);
+        if (!part) goto failed;
+        t->ranges[t->count++] = part;
+    }
+    *token = t;
+    return 1;
+
+failed:
+    nvn_dirty_buffer_end(t);
+    return 0;
+}
+#endif
 #endif
 
 #if !defined(GAME_BOTW)

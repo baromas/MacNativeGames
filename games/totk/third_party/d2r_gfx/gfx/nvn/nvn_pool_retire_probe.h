@@ -65,6 +65,30 @@ int mtl_probe_pool_retire(void) {
         }
         res_remove(readback);
     }
+#ifdef GAME_OOT
+    /* A new pool can touch a page already protected by a different pool.
+       The Metal buffer can be created successfully while writes fail silently. */
+    @autoreleasepool {
+        size_t page = (size_t)getpagesize();
+        uint8_t *middle = (uint8_t *)mem + page;
+        memset(mem, 0x20, 3 * page);
+        nvn_dirty_add_range(middle, page);
+        nvn_dirty_protect(middle, page);
+        uint64_t stamp = nvn_dirty_now();
+        mtl_pool_add(mem, 3 * page);
+        if (nvn_dirty_since(middle, page, stamp)) MDIE("pool creation unexpectedly invalidated the tracked page");
+        op_hdr end = {OP_END, 8};
+        mtl_sub_begin(); mtl_exec((const uint8_t *)&end);
+        mtl_sub_fill((uintptr_t)mem, 3 * page, 0xa5a5a5a5u);
+        mtl_sub_commit(); mtl_finish();
+        for (size_t p = 0; p < 3 * page; p++) {
+            if (((uint8_t *)mem)[p] != 0xa5) MDIE("pool fill over protected neighbour missed byte %zu", p);
+        }
+        nvn_dirty_remove_range(middle);
+        mtl_pool_del(mem); res_commit();
+        checked += (int)(3 * page + 1);
+    }
+#endif
     g_res_remove_no_pool = 0;
     free(mem); return checked;
 }

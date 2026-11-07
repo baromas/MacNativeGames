@@ -105,7 +105,11 @@ class Ns2ShaderAdapters(unittest.TestCase):
             reflection=json.loads((self.work/(rq['variant']+'_b.json')).read_text())
             self.assertEqual(reflection['mesh_stage']['kind'],kind)
             self.assertEqual(reflection['drv_unfillable'],[])
-            self.compile_metal((self.work/(rq['variant']+'_b.metal')).read_text())
+            shader=(self.work/(rq['variant']+'_b.metal')).read_text()
+            if kind=='ms':
+                self.assertRegex(shader,r'\(\(threadgroup uchar\*\)&\w+\[0\]\)')
+                self.assertNotIn('atomic_compare_exchange',shader)
+            self.compile_metal(shader)
 
     def test_ampere_global_address_and_atomic_forms(self):
         # Adapted from nxnative's constructed SM86 fixtures, MIT. A memory
@@ -130,3 +134,46 @@ class Ns2ShaderAdapters(unittest.TestCase):
             shader=lower(op)
             self.assertIn('atomic_compare_exchange',shader)
             self.compile_metal(shader)
+
+    def test_ampere_depth_follows_enabled_render_target_blocks(self):
+        xlate=Path(os.environ.get('MNG_TEST_XLATE',ROOT/'games/totk/prebuilt/macos-arm64/totk_xlate'))
+        for mask,depth in ((0,r'0[.]125'),(0xf,r'0[.]5'),(0x10f,r'0[.]75'),(0x80000001,r'0[.]75')):
+            with self.subTest(mask=hex(mask)):
+                header=bytearray(0x80)
+                struct.pack_into('<I',header,0,0x000c5482)
+                struct.pack_into('<I',header,0x14,0xb0000000)
+                struct.pack_into('<II',header,0x48,mask,2)   # fragment outputs, depth written
+                # MOV Rn, immediate; each possible depth register gets a
+                # distinct value. EXIT emits the depth from the selected register.
+                body=b''.join(struct.pack('<QQ',(value<<32)|(reg<<16)|0x7802,0x000fe20000000f00)
+                              for reg,value in ((1,0x3e000000),(3,0x3e800000),(5,0x3f000000),(6,0x3e800000),(9,0x3f400000)))
+                code=self.work/'depth.code'
+                code.write_bytes(header+body+struct.pack('<QQ',0x794d,0x000fea0003800000))
+                rq=dict(variant='depth',stage='ps',arch='sm86',code=str(code),tex={},img={},attr={},fout={})
+                p=subprocess.run([str(xlate),'--service','--spirv-cross','(linked in)','--out',str(self.work),'--chain','synthetic-depth-test'],
+                                 input=json.dumps(rq)+'\n',capture_output=True,text=True,timeout=30)
+                self.assertEqual(p.returncode,0,p.stderr)
+                self.assertTrue(json.loads(p.stdout)['ok'],p.stdout+p.stderr)
+                shader=(self.work/'depth_b.metal').read_text()
+                self.assertRegex(shader,rf'gl_FragDepth = {depth}\b')
+                self.compile_metal(shader)
+
+    def test_ampere_shared_half_word_store(self):
+        xlate=Path(os.environ.get('MNG_TEST_XLATE',ROOT/'games/totk/prebuilt/macos-arm64/totk_xlate'))
+        code=self.work/'shared_half.code'
+        # MOV R0,0xbeef; STS.U16 [RZ+2],R0; EXIT.
+        code.write_bytes(b''.join(struct.pack('<QQ',lo,hi) for lo,hi in (
+            ((0xbeef<<32)|0x7802,0x000fe20000000f00),
+            ((2<<40)|(255<<24)|0x7388,0x000fe80000000400),
+            (0x794d,0x000fea0003800000))))
+        rq=dict(variant='shared_half',stage='cs',arch='sm86',code=str(code),tex={},img={},attr={},fout={},
+                local=[32,1,1],shared=4096,nvn2_cs=[0,0,3,0x40,0])
+        p=subprocess.run([str(xlate),'--service','--spirv-cross','(linked in)','--out',str(self.work),'--chain','synthetic-store-test'],
+                         input=json.dumps(rq)+'\n',capture_output=True,text=True,timeout=30)
+        self.assertEqual(p.returncode,0,p.stderr)
+        self.assertTrue(json.loads(p.stdout)['ok'],p.stdout+p.stderr)
+        shader=(self.work/'shared_half_b.metal').read_text()
+        self.assertIn('typedef ushort __attribute__((may_alias)) dm_ushort_alias;',shader)
+        self.assertRegex(shader,r'\(\(threadgroup dm_ushort_alias\*\)&\w+\[0\]\)\[uint\(\w+\) >> 1u\]')
+        self.assertNotIn('atomic_compare_exchange',shader)
+        self.compile_metal(shader)

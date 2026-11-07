@@ -513,6 +513,7 @@ static partial class ShaderService
         HashSet<long> depthSlots = DepthSlots(tex);
         var compareSlots = CompareSlots(src);   // before the depth rewrite: it drops spvDepthCast, not the compare
         src = PostProcess(src, depthSlots);
+        if (GetStr(rq, "arch", "") == "sm86") src = ShaderSharedStores.Rewrite(src);
         src = ShaderPools.Rewrite(src);
         if (stage == "vs" && GetStr(rq, "arch", "") == "sm86") src = ShaderBaseInstance.Rewrite(src);
         // Image and buffer-texture handles read from memory keep Ryujinx's short arrays, which the host does not fill: its draws are skipped, the game goes on.

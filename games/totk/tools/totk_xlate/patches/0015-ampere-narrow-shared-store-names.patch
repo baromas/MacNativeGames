@@ -1,0 +1,14 @@
+From seedds/nxnative ffebfd59 (MIT). The service recognizes the named SPIRV-Cross helpers.
+
+--- a/src/Ryujinx.Graphics.Shader/Translation/HelperFunctionManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/HelperFunctionManager.cs
+@@ -227,7 +227,8 @@
+ 
+             context.Return();
+ 
+-            return new Function(ControlFlowGraph.Create(context.GetOperations()).Blocks, $"SharedStore{bitSize}_{id}", false, 2, 0);
++            // Preserve the name for the NVN2 Metal shared-store rewrite.
++            return new Function(ControlFlowGraph.Create(context.GetOperations()).Blocks, $"dmsh_shared_store{bitSize}_{id}", false, 2, 0);
+         }
+ 
+         private static Function GenerateShuffleFunction(HelperFunctionName functionName, int subgroupSize)

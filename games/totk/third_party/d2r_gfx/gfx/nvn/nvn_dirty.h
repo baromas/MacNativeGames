@@ -13,6 +13,10 @@ uint64_t nvn_dirty_now(void);                                      // 当前代�
 int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp);
 void *nvn_dirty_gpu_write_begin(void *addr, size_t len);   // write guest memory on behalf of the GPU: not counted as a CPU write
 void nvn_dirty_gpu_write_end(void *tok);
+#ifdef GAME_OOT
+int nvn_dirty_buffer_begin(void *addr, size_t len, void **token);
+void nvn_dirty_buffer_end(void *token);
+#endif
 typedef struct { uintptr_t page; uint64_t pc, lr; uint32_t src; } nvn_dirty_rec;   // src 0: guest write (fault), 1: host write
 int nvn_dirty_recent(uintptr_t lo, uintptr_t hi, nvn_dirty_rec *out, int max);   // latest unprotections in [lo, hi) (DM_NVN_TILELOG) // 覆盖页在戳之后被写过 → 1 | Covered pages were written after the stamp -> 1
 void nvn_dirty_stats(uint64_t *faults, uint64_t *preps);           // 累计：游戏写触发的缺页次数、宿主写前解保护的页数 | Cumulative: number of page faults triggered by game writes, number of pages unprotected before host writes

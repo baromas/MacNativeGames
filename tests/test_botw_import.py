@@ -141,7 +141,7 @@ class BotwImport(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'test')
         (tree / 'build/shader-seed/botw160/seed-manifest.json').write_text(json.dumps(dict(
-            version='botw160', chain='totk-native-v14-ns2-shader-correctness', shaders=2000,
+            version='botw160', chain='totk-native-v15-ns2-depth-and-stage-stores', shaders=2000,
             files={'pso_manifest.tsv': hashlib.sha256(b'test').hexdigest()})))
         out = self.root / 'BotW.app'
         with patch.object(build_app, 'sign_app'), patch.object(build_app, 'app_seal_valid', return_value=True), \

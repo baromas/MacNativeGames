@@ -1,0 +1,30 @@
+From seedds/nxnative 473c9026 (MIT), limited to NVN2/Ampere.
+
+--- a/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/TranslatorContext.cs
+@@ -159,8 +159,23 @@
+ 
+         internal int GetDepthRegister()
+         {
+-            // The depth register is always two registers after the last color output.
+-            return BitOperations.PopCount((uint)Definitions.OmapTargets) + 1;
++            uint mask = (uint)Definitions.OmapTargets;
++            if (!Options.Flags.HasFlag(TranslationFlags.Ampere))
++            {
++                return BitOperations.PopCount(mask) + 1;
++            }
++
++            // NVN2 packs each enabled color target into four registers even for
++            // partial color masks. The sample mask occupies the next register.
++            int depth = 1;
++            for (; mask != 0; mask >>= 4)
++            {
++                if ((mask & 0xf) != 0)
++                {
++                    depth += 4;
++                }
++            }
++            return depth;
+         }
+ 
+         public void SetLayerOutputAttribute(int attr)
