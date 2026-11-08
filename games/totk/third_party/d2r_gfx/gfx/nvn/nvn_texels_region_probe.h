@@ -1,6 +1,44 @@
+/* The packed RGB copy used by the menu blur, including the odd vertical ratio
+   and nearest-neighbour ties from the horizontal 8:5 ratio. */
+static int probe_scaled_rgb_copy(void) {
+    enum { SW = 80, SH = 45, DW = 50, DH = 28 };
+    MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG11B10Float
+        width:SW height:SH mipmapped:NO];
+    sd.storageMode = MTLStorageModeShared;
+    sd.usage = MTLTextureUsageShaderRead;
+    MTLTextureDescriptor *dd = [sd copy];
+    dd.width = DW; dd.height = DH;
+    dd.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    id<MTLTexture> src = [g_dev newTextureWithDescriptor:sd], dst = [g_dev newTextureWithDescriptor:dd];
+    if (!src || !dst) MDIE("scaled RGB copy probe textures");
+    uint32_t pixels[SW * SH], output[DW * DH];
+    for (unsigned y = 0; y < SH; y++) for (unsigned x = 0; x < SW; x++) {
+        uint32_t r = 0x3c0 + x % 64, g = 0x3c0 + y % 64, b = 0x1e0 + (x + y) % 32;
+        pixels[y * SW + x] = r | (g << 11) | (b << 22);
+    }
+    [src replaceRegion:MTLRegionMake2D(0, 0, SW, SH) mipmapLevel:0 withBytes:pixels bytesPerRow:SW * 4];
+    res_add(src); res_add(dst);
+    tex_t s = {.serial = nvn_new_serial(), .mem = (uint8_t *)pixels};
+    tex_t d = {.serial = nvn_new_serial(), .mem = (uint8_t *)output};
+    s.L.size = sizeof pixels; d.L.size = sizeof output;
+    s.d = (nvn_texdesc){.width = SW, .height = SH, .depth = 1, .target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_R11G11B10F, .levels = 1};
+    d.d = s.d; d.d.width = DW; d.d.height = DH;
+    serial_put(s.serial, src); serial_put(d.serial, dst);
+    p_copy_t2t copy = {.src = &s, .dst = &d, .sr = {0, 0, 0, SW, SH, 1}, .dr = {0, 0, 0, DW, DH, 1}};
+    mtl_sub_begin(); copy_t2t(&copy); mtl_sub_commit(); mtl_finish();
+    [dst getBytes:output bytesPerRow:DW * 4 fromRegion:MTLRegionMake2D(0, 0, DW, DH) mipmapLevel:0];
+    for (unsigned y = 0; y < DH; y++) for (unsigned x = 0; x < DW; x++) {
+        unsigned sx = ((2 * x + 1) * SW) / (2 * DW), sy = ((2 * y + 1) * SH) / (2 * DH);
+        if (output[y * DW + x] != pixels[sy * SW + sx]) MDIE("scaled RGB copy mismatch at %u,%u", x, y);
+    }
+    mtl_tex_release(&s); mtl_tex_release(&d);
+    MLOG("[t2t] scaled RGB copy: %d texels match the CPU reference", DW * DH);
+    return 1;
+}
+
 /* Production ReadTexels/WriteTexels roundtrip, including the guest pool and Metal mirror. */
 int mtl_probe_texels_region(void) {
-    mtl_init();int checked=0;
+    mtl_init();int checked=probe_scaled_rgb_copy();
     const int formats[]={0x25,0x19,0x1d,0x22,0x3a,0x3b,0x3c,0x41,0x48,0x79};
     for(int c=0;c<14;c++) {@autoreleasepool {
         tex_t t={0};t.serial=0xffffd000u+c;

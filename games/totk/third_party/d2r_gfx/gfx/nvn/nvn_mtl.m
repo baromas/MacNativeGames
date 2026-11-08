@@ -16472,8 +16472,63 @@ static int copy_t2t_astc(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
     defer_obj_unref(sv); defer_obj_unref(dv); defer_obj_release(pb);   // 本次提交跑完再放（视图不单独驻留，参数块撤驻留） | Release after this submit has finished running (views are not made resident separately; the parameter block is removed from residency)
     return 1;
 }
-// GPU：贴图 → 贴图（原先误列为空操作，选角页每帧 3 次）。等尺寸、不镜像、同格式 → 逐层 blit；其余语义（缩放带过滤、镜像、换格式）blit 表达不了，报红待实现
-// GPU: texture -> texture (previously mislisted as a no-op, 3 times per frame on the character select page). Same size, not mirrored, same format -> blit layer by layer; the other semantics (scaling with filtering, mirroring, format change) cannot be expressed by blit: report a failure, to be implemented
+/* Metal blits cannot resize. The menu blur uses a whole-level, nearest
+   copy of packed RGB floats. Render into the destination so it needs no
+   image-store usage or storage recreation. */
+static int copy_t2t_scaled_rgb(id<MTLTexture> src, id<MTLTexture> dst) {
+    static id<MTLRenderPipelineState> pipeline;
+    static id<MTL4ArgumentTable> args;
+    if (!pipeline) {
+        NSError *error = nil;
+        NSString *source = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "vertex float4 copy_vs(uint i [[vertex_id]]) { float2 uv = float2((i << 1) & 2, i & 2);"
+            " return float4(uv * float2(2,-2) + float2(-1,1),0,1); }"
+            "fragment float4 copy_fs(float4 p [[position]], texture2d<float,access::read> src [[texture(0)]],"
+            " constant uint2& dst [[buffer(0)]]) { uint2 size(src.get_width(),src.get_height());"
+            " return src.read((2u * uint2(p.xy) + 1u) * size / (2u * dst)); }";
+        id<MTLLibrary> library = [g_dev newLibraryWithSource:source options:nil error:&error];
+        MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+        pd.vertexFunction = [library newFunctionWithName:@"copy_vs"];
+        pd.fragmentFunction = [library newFunctionWithName:@"copy_fs"];
+        pd.colorAttachments[0].pixelFormat = MTLPixelFormatRG11B10Float;
+        if (pd.vertexFunction && pd.fragmentFunction)
+            pipeline = [g_dev newRenderPipelineStateWithDescriptor:pd error:&error];
+        if (!pipeline) { MLOG("RGB texture resize pipeline unavailable: %s", error.localizedDescription.UTF8String); return 0; }
+    }
+    if (!args) {
+        MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new];
+        ad.maxTextureBindCount = 1; ad.maxBufferBindCount = 1;
+        args = [g_dev newArgumentTableWithDescriptor:ad error:nil];
+        if (!args) return 0;
+    }
+    id<MTLBuffer> size_buffer;
+    size_t offset = arena_alloc(8, &size_buffer);
+    uint32_t size[2] = {(uint32_t)dst.width, (uint32_t)dst.height};
+    memcpy((uint8_t *)size_buffer.contents + offset, size, sizeof size);
+    MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+    rp.colorAttachments[0].texture = dst;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    blit_close(); rs_sync(); ser_gate(); pt_mark(g_cb, 'R', rp);
+    id<MTL4RenderCommandEncoder> encoder = [g_cb renderCommandEncoderWithDescriptor:rp];
+    if (!encoder) return 0;
+    [encoder barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageFragment visibilityOptions:MTL4VisibilityOptionDevice];
+    [args setTexture:src.gpuResourceID atIndex:0];
+    [args setAddress:size_buffer.gpuAddress + offset atIndex:0];
+    [encoder setArgumentTable:args atStages:MTLRenderStageFragment];
+    [encoder setRenderPipelineState:pipeline];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [encoder barrierAfterStages:MTLStageFragment beforeQueueStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+    [encoder endEncoding];
+    return 1;
+}
+static int copy_t2t_plain_rgb_view(const view_t *v, int used) {
+    return !used || ((!v->set_levels || v->base_level == 0) && (!v->set_layers || v->min_layer == 0) &&
+        (!v->set_format || v->format == NVN_FORMAT_R11G11B10F) &&
+        (!v->set_target || v->target == NVN_TEXTURE_TARGET_2D) && !v->set_swizzle && !v->stencil);
+}
+
+// Same-size copies use Metal blits. Whole-level packed RGB resizes use a draw.
 static void copy_t2t(const p_copy_t2t *c) {
     { static long on = -1; static int left = 24; if (on < 0) { const char *e = getenv("TOTK_T2T_LOG"); on = e ? atol(e) : 0; if (e && !on) on = 1; }   // TOTK_T2T_LOG=<from frame> (diagnostic): 24 texture copies from that frame, their ends
       if (on > 0 && (long)atomic_load(&g_cur_frame) >= on && left > 0 && c->src && c->dst) { left--;
@@ -16508,7 +16563,25 @@ static void copy_t2t(const p_copy_t2t *c) {
         for (int z = 0; z < nz && ok; z++) ok = copy_t2t_astc(s, d, sl, sz0 + c->sr.zoffset + z, dl, dz0 + c->dr.zoffset + z, c->sr.xoffset, c->sr.yoffset, c->dr.xoffset, c->dr.yoffset, c->sr.width, c->sr.height);
         if (ok) return;
     }
-    if (c->sr.width != c->dr.width || c->sr.height != c->dr.height || (c->sr.depth ? c->sr.depth : 1) != (c->dr.depth ? c->dr.depth : 1) || (c->flags & ~NVN_COPY_FLAGS_ENGINE_2D_BIT & ~NVN_COPY_FLAGS_LINEAR_FILTER_BIT)
+    int resized = c->sr.width != c->dr.width || c->sr.height != c->dr.height;
+    if (resized && !c->flags && s != d && s.textureType == MTLTextureType2D && d.textureType == MTLTextureType2D &&
+        s.pixelFormat == MTLPixelFormatRG11B10Float && d.pixelFormat == s.pixelFormat &&
+        s.sampleCount == 1 && d.sampleCount == 1 && (d.usage & MTLTextureUsageRenderTarget) &&
+        copy_t2t_plain_rgb_view(&c->sv, c->has_sv) && copy_t2t_plain_rgb_view(&c->dv, c->has_dv) &&
+        !c->sr.xoffset && !c->sr.yoffset && !c->sr.zoffset && !c->dr.xoffset && !c->dr.yoffset && !c->dr.zoffset &&
+        c->sr.depth == 1 && c->dr.depth == 1 && c->sr.width == (int)s.width && c->sr.height == (int)s.height &&
+        c->dr.width == (int)d.width && c->dr.height == (int)d.height) {
+        uintptr_t sa = (uintptr_t)c->src->mem, da = (uintptr_t)c->dst->mem;
+        int disjoint = sa < da ? da - sa >= c->src->L.size : sa - da >= c->dst->L.size;
+        if (sa && da && sa != da && disjoint && copy_t2t_scaled_rgb(s, d)) {
+            gpu_owned_mark(c->dst->serial);
+            static int logged;
+            if (!logged++) MLOG("[t2t] scaled RGB copy %dx%d -> %dx%d at frame %llu",
+                c->sr.width, c->sr.height, c->dr.width, c->dr.height, (unsigned long long)atomic_load(&g_cur_frame));
+            return;
+        }
+    }
+    if (resized || (c->sr.depth ? c->sr.depth : 1) != (c->dr.depth ? c->dr.depth : 1) || (c->flags & ~NVN_COPY_FLAGS_ENGINE_2D_BIT & ~NVN_COPY_FLAGS_LINEAR_FILTER_BIT)
         || s.pixelFormat != d.pixelFormat || s3 != d3) {
         RED_ONCE(33, "贴图→贴图拷贝未实现的形态：%dx%dx%d→%dx%dx%d 标志 %#x 格式 %lu→%lu 3D %d→%d", c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth,
                  c->flags, (unsigned long)s.pixelFormat, (unsigned long)d.pixelFormat, s3, d3);
