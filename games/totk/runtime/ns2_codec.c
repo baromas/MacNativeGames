@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <dav1d/dav1d.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
