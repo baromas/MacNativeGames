@@ -270,12 +270,21 @@ static struct { uint64_t adds, removes, live_bytes; _Atomic uint64_t alive, aliv
 static char g_alloc_track_key;
 static NSMapTable *g_res_site_of;   // resource (weak key) -> NSNumber source line
 static uint64_t g_res_live_bytes;
-static void res_add_at(id<MTLResource> r, int site) {
-    if (!r) return;
+static void res_add_at(id<MTLAllocation> allocation, int site) {
+    if (!allocation) return;
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+    id<MTLHeap> heap = [(id)allocation conformsToProtocol:@protocol(MTLResource)] ? ((id<MTLResource>)allocation).heap : nil;
+    id<MTLAllocation> r = heap ?: allocation;
+#else
+    id<MTLAllocation> r = allocation;
+#endif
     if (site < 0 || site >= RES_SITES) site = 0;
     pthread_mutex_lock(&g_res_mu);
-    [g_res addAllocation:(id<MTLAllocation>)r];
     if (!g_res_objects) { g_res_objects = [NSHashTable weakObjectsHashTable]; g_res_site_of = [NSMapTable weakToStrongObjectsMapTable]; }
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+    if (heap && [g_res_objects containsObject:r]) { pthread_mutex_unlock(&g_res_mu); return; }
+#endif
+    [g_res addAllocation:r];
     if (![g_res_objects containsObject:r]) {
         uint64_t sz = (uint64_t)r.allocatedSize;
         [g_res_objects addObject:r]; [g_res_site_of setObject:@(site) forKey:r];
@@ -289,7 +298,7 @@ static void res_add_at(id<MTLResource> r, int site) {
     pthread_mutex_unlock(&g_res_mu);
 }
 #define res_add(r) res_add_at((r), __LINE__)
-static void res_remove_body(id<MTLResource> r) {
+static void res_remove_body(id<MTLAllocation> r) {
     if (!r) return;
     pthread_mutex_lock(&g_res_mu);
     [g_res removeAllocation:(id<MTLAllocation>)r];
@@ -303,8 +312,11 @@ static void res_remove_body(id<MTLResource> r) {
     pthread_mutex_unlock(&g_res_mu);
 }
 static int g_res_remove_no_pool; // GPU probe negative control only
-static void res_remove(id<MTLResource> r) {
+static void res_remove(id<MTLAllocation> r) {
     if (!r) return;
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+    if ([(id)r conformsToProtocol:@protocol(MTLResource)] && ((id<MTLResource>)r).heap) return;
+#endif
     if (g_res_remove_no_pool) { res_remove_body(r); return; }
     /* Pool/texture finalization also runs on long-lived guest threads outside
        mtl_sub_begin/commit's autorelease scope. Foundation/Metal removal leaves
@@ -313,6 +325,87 @@ static void res_remove(id<MTLResource> r) {
        residency commit ordering remain responsible for resource lifetime. */
     @autoreleasepool { res_remove_body(r); }
 }
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+/* Each live texture owns a separate heap. Its owner returns the heap only when the texture
+   and its views are gone, after the existing deferred releases. Based on nxnative 7f50222. */
+enum { RT_HEAP_IDLE_CAP = 128 << 20 };
+static const uint64_t rt_heap_idle_ns = 1000000000ull;
+static os_unfair_lock g_rt_heap_lock = OS_UNFAIR_LOCK_INIT;
+typedef struct { void *heap; uint64_t idle_since; } rt_heap_entry;
+static rt_heap_entry g_rt_idle[128];
+static size_t g_rt_idle_count, g_rt_idle_bytes;
+static _Atomic uint64_t g_rt_heap_created, g_rt_heap_reused, g_rt_heap_removed;
+static char g_rt_heap_key;
+
+static int rt_heap_enabled(void) {
+    const char *value = getenv("TOTK_OOT_RT_RECYCLE");
+    return value && !strcmp(value, "1");
+}
+
+@interface NvRenderTargetHeap : NSObject { @public id<MTLHeap> heap; } @end
+@implementation NvRenderTargetHeap
+- (void)dealloc {
+    if (!heap) return;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    NSUInteger size = heap.size;
+    os_unfair_lock_lock(&g_rt_heap_lock);
+    int keep = g_rt_idle_count < sizeof g_rt_idle / sizeof *g_rt_idle &&
+               size <= RT_HEAP_IDLE_CAP - g_rt_idle_bytes;
+    if (keep) {
+        g_rt_idle[g_rt_idle_count++] = (rt_heap_entry){(void *)CFBridgingRetain(heap), now};
+        g_rt_idle_bytes += size;
+    }
+    os_unfair_lock_unlock(&g_rt_heap_lock);
+    if (!keep) { res_remove(heap); atomic_fetch_add(&g_rt_heap_removed, 1); }
+}
+@end
+
+static id<MTLHeap> rt_heap_take(MTLTextureDescriptor *d, NSUInteger bytes, int *reused) {
+    void *taken = NULL;
+    os_unfair_lock_lock(&g_rt_heap_lock);
+    size_t best = g_rt_idle_count;
+    NSUInteger best_size = NSUIntegerMax;
+    for (size_t i = 0; i < g_rt_idle_count; i++) {
+        id<MTLHeap> h = (__bridge id<MTLHeap>)g_rt_idle[i].heap;
+        NSUInteger size = h.size;
+        if (size < bytes || size - bytes > bytes / 8 || size >= best_size) continue;
+        if (h.storageMode != d.storageMode || h.cpuCacheMode != d.cpuCacheMode) continue;
+        best = i; best_size = size;
+    }
+    if (best < g_rt_idle_count) {
+        taken = g_rt_idle[best].heap;
+        g_rt_idle_bytes -= best_size;
+        g_rt_idle[best] = g_rt_idle[--g_rt_idle_count];
+    }
+    os_unfair_lock_unlock(&g_rt_heap_lock);
+    *reused = taken != NULL;
+    if (taken) return CFBridgingRelease(taken);
+    MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+    hd.type = MTLHeapTypePlacement;
+    hd.size = bytes;
+    hd.storageMode = d.storageMode;
+    hd.cpuCacheMode = d.cpuCacheMode;
+    hd.hazardTrackingMode = d.hazardTrackingMode;
+    return [g_dev newHeapWithDescriptor:hd];
+}
+
+static void rt_heap_trim(void) {
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    void *expired[sizeof g_rt_idle / sizeof *g_rt_idle];
+    size_t count = 0;
+    os_unfair_lock_lock(&g_rt_heap_lock);
+    for (size_t i = 0; i < g_rt_idle_count;) {
+        if (now - g_rt_idle[i].idle_since < rt_heap_idle_ns) { i++; continue; }
+        void *heap = g_rt_idle[i].heap;
+        g_rt_idle_bytes -= ((__bridge id<MTLHeap>)heap).size;
+        expired[count++] = heap;
+        g_rt_idle[i] = g_rt_idle[--g_rt_idle_count];
+    }
+    os_unfair_lock_unlock(&g_rt_heap_lock);
+    for (size_t i = 0; i < count; i++) { id<MTLHeap> heap = CFBridgingRelease(expired[i]); res_remove(heap); }
+    atomic_fetch_add(&g_rt_heap_removed, count);
+}
+#endif
 /* Top registration sites by live resident bytes (caller must not hold g_res_mu). */
 static void res_site_report(int top) {
     pthread_mutex_lock(&g_res_mu);
@@ -385,7 +478,8 @@ static void res_check(id r, const char *what, int reg) {
     if (!is_tex && !is_buf) return;   // 采样器等不是分配 | Samplers etc. are not allocations
     id<MTLResource> a = r; int hops = 0;
     if (is_tex) { id<MTLTexture> t = (id<MTLTexture>)a; while (t.parentTexture) { t = t.parentTexture; hops++; } a = t.buffer ? (id<MTLResource>)t.buffer : (id<MTLResource>)t; }
-    pthread_mutex_lock(&g_res_mu); int ok = [g_res_objects containsObject:a]; pthread_mutex_unlock(&g_res_mu);
+    id<MTLAllocation> allocation = a.heap ?: (id<MTLAllocation>)a;
+    pthread_mutex_lock(&g_res_mu); int ok = [g_res_objects containsObject:allocation]; pthread_mutex_unlock(&g_res_mu);
     if (!ok) { nbad++; id<MTLTexture> t = is_tex ? (id<MTLTexture>)r : nil;
         MLOG("【红】驻留缺失 #%d：%s 槽 %d %s %p（父链 %d 层）分配 %lu B 存储 %lu%s", nbad, what, reg, is_tex ? "贴图" : "缓冲", (__bridge void *)a, hops, (unsigned long)a.allocatedSize, (unsigned long)a.storageMode,
              t ? [NSString stringWithFormat:@" 格式 %lu %lux%lu 类型 %lu 用途 %#lx", (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.textureType, (unsigned long)t.usage].UTF8String : ""); }
@@ -1326,6 +1420,9 @@ void mtl_sub_begin(void) {
     { static int ka; if (!ka) { ka = 1; keepalive_start(); } atomic_store(&g_last_sub_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }
     if (tbdr_on() == 0 && g_ruler_pending) { g_ruler_truth = 0; g_ruler_pending = 0; MLOG("DM_NVN_RULER：切到被测模式"); }
     defer_drain();
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+    if (rt_heap_enabled()) rt_heap_trim();
+#endif
     defer_reset();
     warm_claim();
     if (g_cb) MDIE("提交重入");
@@ -1439,7 +1536,12 @@ static inline void m4_end_render_m(id<MTL4RenderCommandEncoder> e, int m) {   //
    encoder starts with a queue barrier, so two consecutive stamps bracket one encoder. Mid-submission commits are skipped in
    those frames (a stamp at the top of a new command buffer would not wait for the previous one). The report is printed when
    the submission's GPU work has completed. */
-typedef struct { char kind; uint32_t w, h, fmt, nc, nload, nstore, depth; uint64_t draw0; char key[12]; } pt_ent;
+typedef struct {
+    char kind;
+    uint32_t w, h, fmt, nc, nload, nstore, depth, mesh_draws;
+    uint64_t draw0;
+    char key[12], mesh_key[17];
+} pt_ent;
 #define PT_MAX 2048
 static _Atomic uint64_t g_cur_frame; static uint64_t g_stat_draw;   // tentative declarations, defined further down
 static _Atomic uint64_t g_stat_views;   // texture views made for texture ids (mtl_view_stats; the long-frame log's detail)
@@ -1487,6 +1589,11 @@ static void pt_mark(id cb, char kind, MTL4RenderPassDescriptor *d) {
               p->nload += d.depthAttachment.texture && d.depthAttachment.loadAction == MTLLoadActionLoad; p->nstore += d.depthAttachment.texture && d.depthAttachment.storeAction == MTLStoreActionStore; }
 }
 static void pt_note_key(const char *key) { if (g_pt_key_pending && g_pt_n && key) { memcpy(g_pt[g_pt_n - 1].key, key, 8); g_pt[g_pt_n - 1].key[8] = 0; g_pt_key_pending = 0; } }
+static void pt_note_mesh(const char *key) {
+    if (!g_pt_heap || !g_pt_n || g_pt[g_pt_n - 1].kind != 'R') return;
+    pt_ent *entry = &g_pt[g_pt_n - 1];
+    if (entry->mesh_draws++ == 0 && key) snprintf(entry->mesh_key, sizeof entry->mesh_key, "%.16s", key);
+}
 // Final stamp of a profiled submission and its report on completion (adds a feedback handler to o).
 static void pt_finish(id cb, TotkCommitOptions *o, uint64_t frame) {
     if (!g_pt_heap || !g_pt_n) return;
@@ -1508,7 +1615,7 @@ static void pt_finish(id cb, TotkCommitOptions *o, uint64_t frame) {
         for (int k = 0; k < m && k < 40 && !fp; k++) { int i = ord[k]; const pt_ent *p = &ents[i]; uint64_t dn = (i + 1 < n ? ents[i + 1].draw0 : draws_end) - p->draw0;
             MLOG("[pass-gpu]   #%d %c %.3f ms 绘制 %llu %ux%u fmt %u 色 %u 深 %u 读入 %u 写回 %u %s", i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->nstore, p->key[0] ? p->key : "-"); }
         if (ff) { for (int i = 0; i + 1 < n; i++) { const pt_ent *p = &ents[i]; uint64_t dn = ents[i + 1].draw0 - p->draw0;
-                      fprintf(ff, "%llu\t%d\t%c\t%.4f\t%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%s\n", (unsigned long long)frame, i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->key[0] ? p->key : "-"); }
+                      fprintf(ff, "%llu\t%d\t%c\t%.4f\t%llu\t%u\t%u\t%u\t%u\t%u\t%u\t%s\t%u\t%s\n", (unsigned long long)frame, i, p->kind, ms[i], (unsigned long long)dn, p->w, p->h, p->fmt, p->nc, p->depth, p->nload, p->key[0] ? p->key : "-", p->mesh_draws, p->mesh_key[0] ? p->mesh_key : "-"); }
                   fclose(ff); }
         free(ms); free(ord); free(ents);
     }];
@@ -2788,8 +2895,69 @@ static int rp_active(void);
 static inline void *hm_get_ptr(const nvn_hmap *m, const void *k) { return nvn_hm_get(m, k); }
 static void *serial_ptr(uint64_t k) { pthread_mutex_lock(&g_smu); void *o = nvn_hm_get(&g_by_serial, &k); pthread_mutex_unlock(&g_smu); return o; }
 static __unsafe_unretained id serial_get(uint64_t k) { pthread_mutex_lock(&g_smu); __unsafe_unretained id o = hm_get_id(&g_by_serial, &k); pthread_mutex_unlock(&g_smu); return o; }
-static void serial_put(uint64_t k, id o) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) { if (stor_unref_locked(old, k)) defer_obj_unref(old); else defer_obj_release(old); } hm_put_id(&g_by_serial, &k, o); stor_ref_locked(o, k); ser_bump_locked(k); pthread_mutex_unlock(&g_smu); }
-static void serial_del(uint64_t k) { pthread_mutex_lock(&g_smu); id old = hm_get_id(&g_by_serial, &k); if (old) { if (stor_unref_locked(old, k)) defer_obj_unref(old); else defer_obj_release(old); } hm_del_id(&g_by_serial, &k); ser_bump_locked(k); pthread_mutex_unlock(&g_smu); BOTW_SERIAL_NOTE(k, "serial_del") }
+#ifdef GAME_OOT
+/* Pool walks need membership, not a reference to a Metal object. Cache both
+   answers in one atomic word; a collision falls back to the serial table. */
+enum { SERIAL_PRESENCE_N = 1 << 16 };
+static _Atomic uint64_t g_serial_presence[SERIAL_PRESENCE_N];
+static uint64_t g_presence_hits, g_presence_misses;
+static int g_presence_on;
+__attribute__((constructor)) static void serial_presence_config(void) {
+    const char *e = getenv("TOTK_OOT_POOL_PRESENCE");
+    g_presence_on = e && !strcmp(e, "1");
+}
+static unsigned serial_presence_slot(uint64_t serial) {
+    return (unsigned)((serial * UINT64_C(0x9E3779B97F4A7C15)) >> 48);
+}
+#endif
+static void serial_presence_note_locked(uint64_t serial, int present) {
+#ifdef GAME_OOT
+    if (g_presence_on && serial && serial <= UINT64_MAX / 2)
+        atomic_store_explicit(&g_serial_presence[serial_presence_slot(serial)], serial * 2 + !!present, memory_order_release);
+#endif
+}
+static int pool_serial_exists(uint64_t serial) {
+    if (!serial) return 0;
+#ifdef GAME_OOT
+    if (g_presence_on && serial <= UINT64_MAX / 2) {
+        uint64_t entry = atomic_load_explicit(&g_serial_presence[serial_presence_slot(serial)], memory_order_acquire);
+        if ((entry >> 1) == serial) { g_presence_hits++; return entry & 1; }
+        g_presence_misses++;
+        pthread_mutex_lock(&g_smu);
+        int present = nvn_hm_get(&g_by_serial, &serial) != NULL;
+        serial_presence_note_locked(serial, present);
+        pthread_mutex_unlock(&g_smu);
+        return present;
+    }
+#endif
+    return serial_get(serial) != nil;
+}
+static void serial_put(uint64_t k, id o) {
+    pthread_mutex_lock(&g_smu);
+    id old = hm_get_id(&g_by_serial, &k);
+    if (old) {
+        if (stor_unref_locked(old, k)) defer_obj_unref(old);
+        else defer_obj_release(old);
+    }
+    hm_put_id(&g_by_serial, &k, o);
+    serial_presence_note_locked(k, o != nil);
+    stor_ref_locked(o, k);
+    ser_bump_locked(k);
+    pthread_mutex_unlock(&g_smu);
+}
+static void serial_del(uint64_t k) {
+    pthread_mutex_lock(&g_smu);
+    id old = hm_get_id(&g_by_serial, &k);
+    if (old) {
+        if (stor_unref_locked(old, k)) defer_obj_unref(old);
+        else defer_obj_release(old);
+    }
+    hm_del_id(&g_by_serial, &k);
+    serial_presence_note_locked(k, 0);
+    ser_bump_locked(k);
+    pthread_mutex_unlock(&g_smu);
+    BOTW_SERIAL_NOTE(k, "serial_del")
+}
 static void ser_bump(uint64_t serial) { pthread_mutex_lock(&g_smu); ser_bump_locked(serial); pthread_mutex_unlock(&g_smu); }
 /* Dead serials (TOTK): the game finalizes temporary NVNtexture objects after recording and before the submission runs,
    so a replay may meet a serial that was already finalized. Previously the replay created a Metal texture for it and
@@ -3591,7 +3759,7 @@ static void stor_release_holders_locked(stor_ent *e) {
     for (int i = 0; i < e->nser; i++) {
         uint64_t s = e->ser[i]; id o = hm_get_id(&g_by_serial, &s); if (!o) continue;
         uint64_t ok = obj_key(o); if (ok != (uint64_t)(uintptr_t)e->tex) nvn_hm_del(&g_stor_of_obj, &ok);
-        defer_obj_unref(o); hm_del_id(&g_by_serial, &s); BOTW_SERIAL_NOTE(s, "storage entry dropped")
+        defer_obj_unref(o); hm_del_id(&g_by_serial, &s); serial_presence_note_locked(s, 0); BOTW_SERIAL_NOTE(s, "storage entry dropped")
     }
     e->nser = 0; ser_bump_locked(0);
 }
@@ -3995,6 +4163,69 @@ static void up_begin(void) {
     if (!g_up_texs) g_up_texs = [NSMutableArray array];
     if (!g_up_keep) g_up_keep = [NSMutableArray array];
 }
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+static id<MTLTexture> rt_heap_texture(const tex_t *t, MTLTextureDescriptor *d) {
+    const unsigned excluded = NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE |
+        NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET;
+    if (!rt_heap_enabled() || !on_sub_thread() || !g_cb || !t->pool || t->has_layout ||
+        !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
+        !(t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) || (t->d.flags & excluded) ||
+        !(d.usage & MTLTextureUsageRenderTarget) || d.storageMode != MTLStorageModePrivate ||
+        d.textureType != MTLTextureType2D || d.mipmapLevelCount != 1) return nil;
+
+    MTLSizeAndAlign need = [g_dev heapTextureSizeAndAlignWithDescriptor:d];
+    if (!need.size || need.size > RT_HEAP_IDLE_CAP) return nil;
+    int reused;
+    id<MTLHeap> heap = rt_heap_take(d, need.size, &reused);
+    id<MTLTexture> mt = [heap newTextureWithDescriptor:d offset:0];
+    if (!mt) {
+        if (reused) { res_remove(heap); atomic_fetch_add(&g_rt_heap_removed, 1); }
+        return nil;
+    }
+    NvRenderTargetHeap *owner = [NvRenderTargetHeap new];
+    owner->heap = heap;
+    objc_setAssociatedObject(mt, &g_rt_heap_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    atomic_fetch_add(reused ? &g_rt_heap_reused : &g_rt_heap_created, 1);
+
+    /* Reused memory contains the former target's pixels. The upload queue clears
+       it before submitting any main commands that can access the new resource. */
+    if (reused) {
+        up_begin();
+        m4_end(g_up_ce);
+        MTLPixelFormat pf = mt.pixelFormat;
+        int depth = pf == MTLPixelFormatDepth16Unorm || pf == MTLPixelFormatDepth32Float ||
+                    pf == MTLPixelFormatDepth32Float_Stencil8;
+        int stencil = pf == MTLPixelFormatStencil8 || pf == MTLPixelFormatDepth32Float_Stencil8;
+        MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
+        if (depth) {
+            rp.depthAttachment.texture = mt;
+            rp.depthAttachment.loadAction = MTLLoadActionClear;
+            rp.depthAttachment.storeAction = MTLStoreActionStore;
+            rp.depthAttachment.clearDepth = 0;
+        }
+        if (stencil) {
+            rp.stencilAttachment.texture = mt;
+            rp.stencilAttachment.loadAction = MTLLoadActionClear;
+            rp.stencilAttachment.storeAction = MTLStoreActionStore;
+            rp.stencilAttachment.clearStencil = 0;
+        }
+        if (!depth && !stencil) {
+            rp.colorAttachments[0].texture = mt;
+            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        }
+        id<MTL4RenderCommandEncoder> en = [g_up_cb renderCommandEncoderWithDescriptor:rp];
+        [en barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+        m4_end(en);
+        g_up_ce = [g_up_cb computeCommandEncoder];
+        [g_up_ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:MTL4VisibilityOptionDevice];
+        [g_up_ce setArgumentTable:g_up_ct];
+        [g_up_texs addObject:mt];
+    }
+    return mt;
+}
+#endif
 static void up_reserve(size_t n) {
     if (g_up_batch_bytes && n > g_up_batch_limit - MIN(g_up_batch_bytes, g_up_batch_limit)) {
         up_flush(); up_begin();
@@ -4569,7 +4800,10 @@ static void *tex_mtl_p(const tex_t *ct) {
     id<MTLTexture> mt = stor_acquire(t, d);   // TOTK: another serial already has a texture at this storage with the same layout
     if (!mt) {
         if (g_tex_prepare_split) return NULL; /* retry preserves the shared GPU content */
-        mt = [g_dev newTextureWithDescriptor:d];
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+        mt = rt_heap_texture(t, d);
+#endif
+        if (!mt) mt = [g_dev newTextureWithDescriptor:d];
         if (!mt) { RED_ONCE(2, "建 MTLTexture 失败 %ux%u 格式 %#x 目标 %d", t->d.width, t->d.height, t->d.format, t->d.target); return NULL; }
         res_add(mt);
         stor_publish(t, mt);
@@ -4592,6 +4826,16 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     pthread_mutex_lock(&g_res_mu); unsigned long nr = (unsigned long)g_res_objects.count; pthread_mutex_unlock(&g_res_mu);
     int live = 0, peak = 0, cap = 0; nvn_dirty_stat(&live, &peak, &cap);
     MLOG("内存 至帧 %llu：常驻 %llu MB，显卡已分配 %llu MB，延迟释放队列 %lu，驻留集 %lu 个，内存池 %d 个（峰值 %d / 跟踪表容量 %d），贴图重传累计 %llu 次", frame, rss_mb, gpu, nd, nr, live, peak, cap, (unsigned long long)g_pkg_reuploads);
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+    if (rt_heap_enabled()) {
+        os_unfair_lock_lock(&g_rt_heap_lock);
+        size_t idle_count = g_rt_idle_count, idle_bytes = g_rt_idle_bytes;
+        os_unfair_lock_unlock(&g_rt_heap_lock);
+        MLOG("[rt-heap] F%llu made %llu reused %llu dropped %llu, idle %zu (%zu MiB)", frame,
+             (unsigned long long)atomic_load(&g_rt_heap_created), (unsigned long long)atomic_load(&g_rt_heap_reused),
+             (unsigned long long)atomic_load(&g_rt_heap_removed), idle_count, idle_bytes >> 20);
+    }
+#endif
     MLOG("已死序号纹理累计 %llu 张（替换前即为泄漏来源）", (unsigned long long)g_dead_put_total);
     /* Exact-writeback snapshots are host allocations, absent from Metal's allocatedSize. Include them in the existing
        diagnostic so an iPhone run can attribute the cost of the larger terrain-normal snapshots (PR #188). */
@@ -6785,6 +7029,12 @@ static void treg_clear_view_locked(int tid) {
 static _Atomic uint64_t g_tser[1 << 20];
 static samp_par *g_sreg; static uint8_t *g_sreg_ok; static void **g_sview; static uint64_t *g_srid; static int g_nsreg;   // g_sview：采样器号 → MTLSamplerState（持有） | g_sview: sampler ID → MTLSamplerState (retained)
 static uint64_t g_pool_reg_gen;
+/* The sampler table has no texture, serial, or frame-time dependencies. Under
+   the registry lock, keep the IDs changed since each table's previous snapshot. */
+enum { SAMP_POOL_NOTES = 256 };
+static uint64_t g_samp_pool_gen;
+static int g_samp_pool_notes[SAMP_POOL_NOTES];
+static void samp_pool_note(int id) { g_samp_pool_notes[++g_samp_pool_gen % SAMP_POOL_NOTES] = id; }
 void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     g_pool_reg_gen++;
     int id_ = tid; if (id_ < 0) return;
@@ -6828,6 +7078,7 @@ void mtl_reg_samp(int sid, const samp_par *sp) {
     if (g_sview[id_]) { CFRelease(g_sview[id_]); g_sview[id_] = NULL; g_srid[id_] = 0; }
     g_reg_gen++;
     g_sreg[id_] = *sp; g_sreg_ok[id_] = 1;
+    samp_pool_note(id_);
     if (samp_border_custom(sp)) atomic_store(&g_border_custom_any, 1);
     registry_unlock();
 }
@@ -7243,6 +7494,7 @@ static int samp_cache_flush(void) {
     int dropped = 0;
     for (int i = 0; i < g_nsreg; i++) if (g_sview && g_sview[i]) { defer_obj_release(CFBridgingRelease(g_sview[i])); g_sview[i] = NULL; g_srid[i] = 0; dropped++; }
     g_reg_gen++;
+    samp_pool_note(-1);
     return dropped;
 }
 void dm_gfx_aniso_set(int n) {
@@ -10811,6 +11063,15 @@ static id<MTLTexture> img_write_view(id<MTLTexture> t, NvShader *sh, uint64_t *r
     *rid = v.gpuResourceID._impl; return v;
 }
 static uint64_t g_pool_frame = ~0ull, g_pool_spent, g_pool_req, g_pool_builds, g_pool_left, g_pool_seen_made;
+static int oot_pool_fast(void) {
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+    static int on = -1;  // called with the registry lock
+    if (on < 0) { const char *env = getenv("TOTK_OOT_POOL_FAST"); on = env && !strcmp(env, "1"); }
+    return on;
+#else
+    return 0;
+#endif
+}
 /* What a walk may make of textures no shader has read: up to a twentieth of the working set, as a pass that runs once has no second frame to find its texture in. A read one is made whatever this says, up to POOL_REQ_BYTES a frame. TOTK_POOL_CAP_MB sets it. */
 static uint64_t pool_cap_bytes(void) { static uint64_t c; if (!c) { const char *e = getenv("TOTK_POOL_CAP_MB"); c = e && *e ? strtoull(e, NULL, 10) << 20 : g_dev.recommendedMaxWorkingSetSize / 20; MLOG("[pool] textures no shader has read: none past %llu MB of Metal allocation (TOTK_POOL_CAP_MB)", (unsigned long long)(c >> 20)); } return c; }
 static int pool_target_type(const treg_t *r) {   // the Metal type a registered texture will have, from its descriptor (a view may choose another: then it is looked at when made)
@@ -10838,7 +11099,7 @@ static uint64_t pool_tex_rid(int id_, int dtt) {   // caller holds g_rmu; 0 = th
     if (!have) {
         int tt = pool_target_type(r), compat = tt == dtt || (tt == MTLTextureType2D && dtt == MTLTextureType2DArray) || (tt == MTLTextureType2DArray && dtt == MTLTextureType2D) || r->has_v;
         if (!compat) return 0;
-        int exists = r->t.serial && serial_get(r->t.serial);
+        int exists = pool_serial_exists(r->t.serial);
         if ((r->t.d.flags & 8) && !exists) return 0;   // COMPRESSIBLE: a render target no pass has written holds nothing to read
         uint64_t sz = r->t.L.size ? r->t.L.size : 1;
         int seen = pool_seen(id_);
@@ -10867,11 +11128,33 @@ static void pool_seen_scan(void) {   // once a submission: the bits the GPU has 
     for (unsigned i = 0; i < words; i++) g_seen_done[i] |= w[i];
 }
 static uint64_t g_pool_stat_frame;
+static uint64_t g_samp_table_gen[POOL_KEYS];
+static uint8_t g_samp_table_valid[POOL_KEYS];
+static int samp_table_patch(uint64_t *table, int base, int n, uint64_t previous) {
+    uint64_t now = g_samp_pool_gen;
+    if (now - previous > SAMP_POOL_NOTES) return 0;
+    for (uint64_t g = previous + 1; g <= now; g++)
+        if (g_samp_pool_notes[g % SAMP_POOL_NOTES] < 0) return 0;
+    for (uint64_t g = previous + 1; g <= now; g++) {
+        int id = g_samp_pool_notes[g % SAMP_POOL_NOTES];
+        if (id <= 0 || id < base || id - base >= n) continue;
+        if (!samp_by_id(id)) return 0;
+        table[id - base] = g_srid[id];
+    }
+    return 1;
+}
 static uint64_t pool_table(int samp, int dtt, int dpf, int base) {   // caller holds g_rmu
     uint64_t fr = atomic_load(&g_cur_frame); pool_seen_scan();
     if (fr != g_pool_frame) { g_pool_frame = fr; g_pool_spent = 0; g_pool_req = 0;
         if (fr / 300 != g_pool_stat_frame / 300) { static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
             MLOG("[pool] up to frame %llu: %llu table walks, %.1f ms a frame; liveness %llu kernel reads, %llu remembered; draw passes %llu without the full barrier, %llu with it; read textures made so far %llu", (unsigned long long)fr, (unsigned long long)g_pool_walks, (double)g_pool_walk_ns * tb.numer / tb.denom / 1e6 / MAX(1, (double)(fr - g_pool_stat_frame)), (unsigned long long)g_pool_live_reads, (unsigned long long)g_pool_live_hits, (unsigned long long)g_bar_skip, (unsigned long long)g_bar_full, (unsigned long long)g_pool_seen_made); g_bar_skip = g_bar_full = 0;
+#ifdef GAME_OOT
+            if (g_presence_on) {
+                MLOG("[pool-presence] F%llu: %llu hits, %llu locked lookups",
+                     (unsigned long long)fr, (unsigned long long)g_presence_hits, (unsigned long long)g_presence_misses);
+                g_presence_hits = g_presence_misses = 0;
+            }
+#endif
             g_pool_stat_frame = fr; g_pool_walks = g_pool_walk_ns = g_pool_live_reads = g_pool_live_hits = 0; } }
     int k = -1, fre = -1; for (int i = 0; i < POOL_KEYS; i++) { if (!g_ptab[i].copy) { if (fre < 0) fre = i; } else if (g_ptab[i].samp == samp && g_ptab[i].dtt == dtt && g_ptab[i].dpf == dpf && g_ptab[i].base == base) { k = i; break; } }
     if (k >= 0 && g_ptab[k].sub == g_sub_serial && g_ptab[k].epoch == g_arena_epoch) return g_ptab[k].gpu;
@@ -10882,19 +11165,33 @@ static uint64_t pool_table(int samp, int dtt, int dpf, int base) {   // caller h
     *(uint32_t *)cpu = (uint32_t)n; *(uint64_t *)(cpu + 8) = samp ? 0 : pool_seen_gpu(); uint64_t *e = (uint64_t *)(cpu + 16);
     if ((size_t)n + 1 > g_ptab[k].cap) { g_ptab[k].cap = (size_t)n + 256; g_ptab[k].copy = realloc(g_ptab[k].copy, g_ptab[k].cap * 8); g_ptab[k].frame = ~0ull; }
     else if (!g_ptab[k].copy) g_ptab[k].copy = malloc(8);
-    if (g_ptab[k].frame == fr && g_ptab[k].n == n && g_ptab[k].reg == g_pool_reg_gen && g_ptab[k].ser == g_ser_gen) memcpy(e, g_ptab[k].copy, 8 * ((size_t)n + 1));   // nothing changed in this frame: the last table holds
+    int samp_fast = samp && oot_pool_fast();
+    if (samp_fast && g_samp_table_valid[k] && g_ptab[k].n == n &&
+        samp_table_patch(g_ptab[k].copy, base, n, g_samp_table_gen[k])) {
+        memcpy(e, g_ptab[k].copy, 8 * ((size_t)n + 1));
+    } else if (!samp_fast && g_ptab[k].frame == fr && g_ptab[k].n == n && g_ptab[k].reg == g_pool_reg_gen && g_ptab[k].ser == g_ser_gen) {
+        memcpy(e, g_ptab[k].copy, 8 * ((size_t)n + 1));   // nothing changed in this frame: the last table holds
+    }
     else {
         uint64_t walk_t0 = mach_absolute_time(); g_pool_walks++;
         uint64_t dummy = samp ? dummy_samp_rid() : (dummy_tex(dtt, dpf) ? g_dummy_tex_rid[dtt & 7][dpf & 3] : 0); int real = 0; g_pool_left = 0;
+        int complete = 1;
         for (int i = 0; i < n; i++) { int id_ = base + i; uint64_t r = 0;
-            if (id_ > 0) { if (samp) { if (id_ < g_nsreg && g_sreg_ok[id_] && samp_by_id(id_)) r = g_srid[id_]; } else if (id_ < g_ntreg) r = pool_tex_rid(id_, dtt); }
+            if (id_ > 0) {
+                if (samp && id_ < g_nsreg && g_sreg_ok[id_]) {
+                    if (samp_by_id(id_)) r = g_srid[id_];
+                    else complete = 0;
+                } else if (!samp && id_ < g_ntreg) r = pool_tex_rid(id_, dtt);
+            }
             e[i] = r ? r : dummy; real += r != 0; }
         e[n] = dummy; memcpy(g_ptab[k].copy, e, 8 * ((size_t)n + 1));
+        if (samp) g_samp_table_valid[k] = complete;
         g_pool_walk_ns += mach_absolute_time() - walk_t0;
         g_ptab[k].frame = fr; g_ptab[k].n = n; g_ptab[k].reg = g_pool_reg_gen; g_ptab[k].ser = g_ser_gen;
         if (g_pool_builds++ < 24 || g_pool_builds % 2000 == 0) MLOG("[pool] %s table (type %d class %d) base %d: %d IDs, %d real, %llu left for later; %llu MB allocated (%llu tables built)", samp ? "sampler" : "texture", dtt, dpf, base, n, real, (unsigned long long)g_pool_left, (unsigned long long)(g_dev.currentAllocatedSize >> 20), (unsigned long long)g_pool_builds);
         if (base && !samp) RED_ONCE(161, "[pool] the bound texture pool starts at ID %d: a handle these shaders take from c2 is off by that much", base);
     }
+    if (samp) g_samp_table_gen[k] = g_samp_pool_gen;
     g_ptab[k].sub = g_sub_serial; g_ptab[k].epoch = g_arena_epoch; g_ptab[k].gpu = gpu;
     return gpu;
 }
@@ -15701,7 +15998,14 @@ frz_plain:;
     { static int noclamp = -1; if (noclamp < 0) noclamp = getenv("TOTK_GPU_NOCLAMP") != NULL;   // TOTK diagnostic: TOTK_GPU_NOCLAMP=1 ignores SetDepthClamp (always clip)
       enc_r_clip(en, S.depth_clamp && !noclamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip); }   // TOTK: SetDepthClamp
     enc_r_blend_color(en, S.blend_color[0], S.blend_color[1], S.blend_color[2], S.blend_color[3]);
-    if (g_mesh_active) { if (pr->sh[1]) encode_args(en, pr->sh[1], 1, 0); mesh_encode((id)en, pr); return; }   // NVN2 task / mesh draw
+    if (g_mesh_active) {
+        if (pr->sh[1]) {
+            if (g_pt_key_pending) pt_note_key(pr->sh[1]->key);
+            encode_args(en, pr->sh[1], 1, 0);
+        }
+        if (g_pt_heap && pr->sh[4]) pt_note_mesh(pr->sh[4]->key);
+        mesh_encode((id)en, pr); return;
+    }   // NVN2 task / mesh draw
     bind_vertex_streams((id<MTL4RenderCommandEncoder>)en,pr->sh[0]);
     vbuf_log(pr->sh[0], pr->sh[1], dw, di);
     if (g_lay.active) enc_r_vbuf(en, LAY_BUF_INDEX, lay_gpu(g_lay_probe_neg == 1 ? 0 : g_lay.cur - g_lay.base));   // TOTK: this draw's layer within the layered pass
@@ -19496,6 +19800,43 @@ static void probe_clear(tex_t *t, MTLClearColor c) {
     memset(&R, 0, sizeof R); R.has_rt = 1; R.rt.n = 1; R.rt.color[0] = t; R.clear_c[0] = 1; R.cc[0] = c; rp_begin(); rp_end();
     memset(&R, 0, sizeof R); mtl_sub_commit(); mtl_finish();
 }
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+static int probe_rt_heap_recycle(void) {
+    enum { W = 64, H = 64 };
+    tex_t t = {.serial = 0xffffffb0, .d = {.width = W, .height = H, .depth = 1, .levels = 1,
+               .target = 1, .format = 0x25, .flags = NVN_TEXTURE_FLAGS_COMPRESSIBLE}};
+    nvn_tex_layout(&t.d, &t.L);
+    size_t size = (t.L.size + getpagesize() - 1) & ~((size_t)getpagesize() - 1);
+    void *mem = mmap(NULL, size * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (mem == MAP_FAILED) MDIE("render target heap probe mmap");
+    pool_t pool = {.mem = mem, .size = size * 2, .flags = NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS |
+                   NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE};
+    t.pool = &pool; t.mem = mem;
+    op_hdr end = {OP_END, 8};
+    int checked = 0;
+    @autoreleasepool {
+        probe_clear(&t, MTLClearColorMake(1, 1, 1, 1));
+        checked += probe_rb_check(tex_mtl(&t), W, H, 0xffffffff, "target before heap recycling");
+        mtl_tex_release(&t);
+        stor_drop_range((uintptr_t)mem, (uintptr_t)mem + size);
+        mtl_sub_begin(); mtl_exec((const uint8_t *)&end); mtl_sub_commit(); mtl_finish();
+    }
+    uint64_t reused = atomic_load(&g_rt_heap_reused);
+    t.serial++; t.mem = (uint8_t *)mem + size; t.off = size;
+    @autoreleasepool {
+        mtl_sub_begin(); mtl_exec((const uint8_t *)&end);
+        id<MTLTexture> texture = tex_mtl(&t);
+        if (!texture.heap || atomic_load(&g_rt_heap_reused) != reused + 1) MDIE("render target heap was not reused");
+        mtl_sub_commit(); mtl_finish();
+        checked += probe_rb_check(texture, W, H, 0, "new target cleared on a recycled heap");
+        mtl_tex_release(&t);
+        stor_drop_range((uintptr_t)t.mem, (uintptr_t)t.mem + size);
+        mtl_sub_begin(); mtl_exec((const uint8_t *)&end); mtl_sub_commit(); mtl_finish();
+    }
+    munmap(mem, size * 2);
+    return checked;
+}
+#endif
 int mtl_probe_compressed_alias(void) {
     if (getenv("TOTK_PROBE_NEGATIVE")) setenv("TOTK_COMPRESSED_ALIAS", "1", 1);
     mtl_init(); enum { W = 16, H = 16 }; int checked = 0;
@@ -19526,6 +19867,9 @@ int mtl_probe_compressed_alias(void) {
         mtl_tex_release(&color);
         stor_drop_range((uintptr_t)mem, (uintptr_t)mem + size); mtl_finish(); munmap(mem, size);
     }
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+    if (rt_heap_enabled()) checked += probe_rt_heap_recycle();
+#endif
     return checked;
 }
 
@@ -20465,8 +20809,60 @@ int mtl_probe_vertex_streams(void) {
    objects alternate with unchanged bindings, then UBO/storage/registry/serial
    changes invalidate them. Separate submissions/passes and snapshot retirement
    must also invalidate. Negative 18 ignores binding generations, 19 snapshots. */
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+static int probe_sampler_table_patch(void) {
+    enum { FIRST = 300, N = 3 };
+    samp_par params = {.lod_max = 16, .magf = 1};
+    mtl_reg_samp(FIRST, &params);
+    registry_lock();
+    uint64_t previous = g_samp_pool_gen;
+    uint64_t dummy = dummy_samp_rid();
+    if (!samp_by_id(FIRST)) MDIE("sampler table probe first registration");
+    uint64_t first = g_srid[FIRST];
+    uint64_t table[N + 1] = {first, dummy, dummy, dummy};
+    registry_unlock();
+    params.magf = 0;
+    mtl_reg_samp(FIRST + 1, &params);
+    registry_lock();
+    if (!samp_table_patch(table, FIRST, N, previous) || table[0] != first ||
+        !g_srid[FIRST + 1] || table[1] != g_srid[FIRST + 1] ||
+        table[2] != dummy || table[N] != dummy) MDIE("sampler table probe incremental update");
+    previous = g_samp_pool_gen;
+    samp_cache_flush();
+    if (samp_table_patch(table, FIRST, N, previous)) MDIE("sampler table probe flush did not request a rebuild");
+    previous = g_samp_pool_gen;
+    for (unsigned i = 0; i <= SAMP_POOL_NOTES; i++) samp_pool_note(FIRST);
+    if (samp_table_patch(table, FIRST, N, previous)) MDIE("sampler table probe overwritten notes did not request a rebuild");
+    registry_unlock();
+    return 3;
+}
+#endif
 int mtl_probe_arg_epoch(void) {
     mtl_init(); int checked = probe_args_invalidation();
+#if defined(GAME_OOT) && !TARGET_OS_IPHONE
+    if (oot_pool_fast()) checked += probe_sampler_table_patch();
+#endif
+#ifdef GAME_OOT
+    if (g_presence_on) {
+        const uint64_t a = UINT64_C(0xffffff00);
+        uint64_t b = a + 1;
+        while (serial_presence_slot(a) != serial_presence_slot(b)) b++;
+        if (pool_serial_exists(a) || pool_serial_exists(b)) MDIE("serial presence probe: initial miss");
+        serial_put(a, [NSObject new]);
+        if (!pool_serial_exists(a) || pool_serial_exists(b) || !pool_serial_exists(a))
+            MDIE("serial presence probe: insertion or collision");
+        id holder = [NSObject new];
+        serial_put(b, holder);
+        serial_del(a);
+        if (pool_serial_exists(a) || !pool_serial_exists(b)) MDIE("serial presence probe: deletion after collision");
+        stor_ent storage = {.tex = (__bridge void *)holder, .ser = &b, .nser = 1};
+        pthread_mutex_lock(&g_smu);
+        stor_release_holders_locked(&storage);
+        pthread_mutex_unlock(&g_smu);
+        if (pool_serial_exists(b)) MDIE("serial presence probe: retired storage");
+        checked += 8;
+    }
+#endif
     const char *ne = getenv("TOTK_PROBE_NEGATIVE"); int negative = ne ? atoi(ne) : 0;
     const size_t size = 16384; void *mem = NULL;
     if (posix_memalign(&mem, size, size) || !mem) MDIE("argument epoch probe memory");
